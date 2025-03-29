@@ -8,6 +8,7 @@ import time
 from tracker import Sort
 import csv
 from datetime import datetime
+from typing import Dict, List, Tuple
 
 class PedestrianAnalyzer:
     def __init__(self):
@@ -33,6 +34,9 @@ class PedestrianAnalyzer:
             
             # Setup CSV logging
             self.setup_csv_logging()
+            
+            # Colors for visualization
+            self.colors = np.random.randint(0, 255, size=(100, 3))
             
             print("Initialization complete.")
             
@@ -268,19 +272,8 @@ class PedestrianAnalyzer:
                     mid_x = int((bbox[0] + bbox[2]) / 2)
                     mid_y = int((bbox[1] + bbox[3]) / 2)
                     
-                    # Initialize crossing times for new track
-                    if track_id not in self.crossing_times:
-                        self.crossing_times[track_id] = {}
-                    
-                    # Check line crossings
-                    line_crossed = self.check_line_crossing((mid_x, mid_y), current_time)
-                    if line_crossed is not None:
-                        # Record the time for this line crossing
-                        self.crossing_times[track_id][line_crossed] = current_time
-                        print(f"Pedestrian {track_id} crossed line {line_crossed+1} at {current_time}")
-                        
-                        # Write/update CSV after each new crossing
-                        self.write_track_to_csv(track_id)
+                    # Process track
+                    track_info = self.process_track((mid_x, mid_y), current_time)
                     
                     # Draw visualization
                     cv2.rectangle(frame, (int(bbox[0]), int(bbox[1])), 
@@ -290,8 +283,7 @@ class PedestrianAnalyzer:
                     cv2.circle(frame, (mid_x, mid_y), 4, (0, 0, 255), -1)
                 
                 # Draw lines
-                for line in self.lane_lines:
-                    cv2.line(frame, line[0], line[1], (255, 0, 0), 2)
+                self.draw_lines(frame)
                 
                 # Show current system time on frame
                 cv2.putText(frame, f"Time: {current_time}", (10, 30),
@@ -324,6 +316,28 @@ class PedestrianAnalyzer:
             cv2.destroyAllWindows()
             if hasattr(self, 'csv_file'):
                 self.csv_file.close()
+
+    def process_track(self, position: Tuple[float, float], frame_time: float) -> Dict:
+        """Process a track and return crossing information"""
+        # Initialize crossing times for new track
+        if position not in self.crossing_times:
+            self.crossing_times[position] = {}
+        
+        # Check line crossings
+        line_crossed = self.check_line_crossing(position, frame_time)
+        if line_crossed is not None:
+            # Record the time for this line crossing
+            self.crossing_times[position][line_crossed] = frame_time
+            print(f"Pedestrian at position {position} crossed line {line_crossed+1} at {frame_time}")
+        
+        return {
+            'crossing_times': self.crossing_times.get(position, {})
+        }
+
+    def draw_lines(self, frame):
+        """Draw all crossing lines on frame"""
+        for line in self.lane_lines:
+            cv2.line(frame, line[0], line[1], (255, 0, 0), 2)
 
     def write_track_to_csv(self, track_id):
         """Update track data in memory and write to CSV"""

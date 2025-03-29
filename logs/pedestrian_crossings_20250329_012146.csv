@@ -1,0 +1,3 @@
+Pedestrian_ID,Lane1_Line1_Time,Lane1_Line2_Time,Lane1_Line3_Time,Lane2_Line1_Time,Lane2_Line2_Time,Lane2_Line3_Time,Lane3_Line1_Time,Lane3_Line2_Time,Lane3_Line3_Time
+3,1:22:51 AM,1:23:15 AM,1:23:37 AM,,1:24:34 AM,1:24:46 AM,1:24:50 AM,1:25:00 AM,1:25:06 AM
+1,1:23:09 AM,1:23:24 AM,1:23:39 AM,1:23:49 AM,1:24:28 AM,,1:24:49 AM,1:25:00 AM,1:25:08 AM

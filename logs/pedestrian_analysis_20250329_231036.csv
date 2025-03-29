@@ -1,0 +1,7 @@
+Pedestrian_ID,Lane1_Line1_Time,Lane1_Line2_Time,Lane1_Line3_Time,Lane2_Line1_Time,Lane2_Line2_Time,Lane2_Line3_Time,Lane3_Line1_Time,Lane3_Line2_Time,Lane3_Line3_Time,Average_Speed,Max_Speed
+1,,,,,,,,,,1.39,2.47
+2,,,,,,,,,,0.28,0.66
+3,,,,,,,,,,1.01,2.12
+4,,,,,,,,,,0.32,0.72
+5,,,,,,,,,,0.17,0.34
+6,,,,,,,,,,0.21,0.36
