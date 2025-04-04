@@ -9,6 +9,16 @@ from typing import Dict, List, Tuple, Optional
 from tracker import Sort
 import csv
 from datetime import datetime
+import mysql.connector
+from mysql.connector import Error
+
+# Add DB configuration
+DB_CONFIG = {
+    'host': 'localhost',
+    'user': 'Traffic1',
+    'password': 'pedestrian',
+    'database': 'traffic_db'
+}
 
 class VehicleSpeedDetector:
     def __init__(self, model_path: str, conf_threshold: float = 0.5):
@@ -46,8 +56,19 @@ class VehicleSpeedDetector:
         self.speeds = {}  # Format: {track_id: {line_idx: speed}}
         self.avg_speeds = {}  # Format: {track_id: avg_speed}
         
-        # CSV data storage
-        self.csv_data = []
+        # Add database connection
+        self.video_id = datetime.now().strftime('%Y%m%d_%H%M%S')
+        try:
+            self.db_connection = mysql.connector.connect(**DB_CONFIG)
+            self.db_cursor = self.db_connection.cursor()
+            print("Successfully connected to MySQL database")
+            
+            # Setup static data for this video session
+            self.setup_sample_data()
+        except Error as e:
+            print(f"Error connecting to MySQL database: {e}")
+            self.db_connection = None
+            self.db_cursor = None
         
     def set_camera_parameters(self, pixels_per_meter: float, fps: float):
         """Set camera calibration parameters"""
@@ -100,6 +121,121 @@ class VehicleSpeedDetector:
             new_p1 = (int(p1[0] + offset_vector[0]), int(p1[1] + offset_vector[1]))
             new_p2 = (int(p2[0] + offset_vector[0]), int(p2[1] + offset_vector[1]))
             self.reference_lines.append((new_p1, new_p2))
+
+    def setup_sample_data(self):
+        """Setup static data for the video session"""
+        try:
+            # Static data for the entire video
+            queries = [
+                """INSERT IGNORE INTO location_dimension 
+                   (location_key, metro_city_province, district, neighborhood, spot) 
+                   VALUES (1, 'Sample City', 'Sample District', 'Sample Area', 'Sample Spot')""",
+                
+                """INSERT IGNORE INTO road_character_dimension 
+                   (road_key, road_type, road_feature) 
+                   VALUES (1, 'Sample Road Type', 'Sample Feature')""",
+                
+                """INSERT IGNORE INTO behavior_feature 
+                   (behavior_id, behavior_feature) 
+                   VALUES 
+                   (1, 'L1_speed'),
+                   (2, 'L2_speed'),
+                   (3, 'L3_speed'),
+                   (4, 'avg_speed')"""
+            ]
+            
+            for query in queries:
+                self.db_cursor.execute(query)
+            self.db_connection.commit()
+            print("Static video data setup complete")
+        except Error as e:
+            print(f"Error setting up static data: {e}")
+
+    def insert_speed_data(self, track_id: int, speeds: dict, avg_speed: float, timestamp: float):
+        """Insert speed data into database"""
+        if not hasattr(self, 'db_cursor') or self.db_cursor is None:
+            print("Database connection not available")
+            return
+        
+        try:
+            if not self.db_connection.is_connected():
+                print("Reconnecting to database...")
+                self.db_connection.reconnect()
+                self.db_cursor = self.db_cursor()
+
+            # Check if this ID already exists
+            check_query = "SELECT time_key FROM time_dimension WHERE time_key = %s"
+            self.db_cursor.execute(check_query, (track_id,))
+            if self.db_cursor.fetchone():
+                print(f"ID {track_id} already exists in database, skipping...")
+                return
+
+            current_time = datetime.now()
+            
+            # Insert time dimension
+            time_query = """
+            INSERT INTO time_dimension 
+            (time_key, week, day, day_night, hour) 
+            VALUES (%s, %s, %s, %s, %s)
+            """
+            time_key = track_id
+            week = f"Week{current_time.strftime('%V')}"
+            day = current_time.strftime('%A')
+            day_night = 'Day' if 6 <= current_time.hour <= 18 else 'Night'
+            hour = current_time.strftime('%Y-%m-%d')
+            
+            self.db_cursor.execute(time_query, (time_key, week, day, day_night, hour))
+
+            # Insert scene dimension
+            scene_query = """
+            INSERT INTO scene_dimension 
+            (scene_key, object_type, event_type) 
+            VALUES (%s, %s, %s)
+            """
+            self.db_cursor.execute(scene_query, (track_id, 'vehicle', 'movement'))
+
+            # Insert fact table
+            fact_query = """
+            INSERT INTO fact_table 
+            (time_key, location_key, road_key, scene_key, scene_ratio, video_code) 
+            VALUES (%s, %s, %s, %s, %s, %s)
+            """
+            self.db_cursor.execute(fact_query, (
+                time_key, 1, 1, track_id, 1.0, f"video_{self.video_id}_{track_id}"
+            ))
+
+            # Insert speed data for each line and average
+            behavior_query = """
+            INSERT INTO scene_behavior_feature 
+            (scene_key, object_type, behavior_id, behavior_value) 
+            VALUES (%s, %s, %s, %s)
+            """
+            
+            # Insert individual line speeds
+            for line_idx, speed in speeds.items():
+                behavior_id = line_idx  # behavior_id 1,2,3 for L1,L2,L3
+                self.db_cursor.execute(behavior_query, (
+                    track_id, 'vehicle', behavior_id, speed
+                ))
+            
+            # Insert average speed
+            self.db_cursor.execute(behavior_query, (
+                track_id, 'vehicle', 4, avg_speed  # behavior_id 4 for average speed
+            ))
+
+            self.db_connection.commit()
+            print(f"Successfully inserted speed data for vehicle {track_id}")
+            
+        except Error as e:
+            print(f"Error inserting speed data: {str(e)}")
+            self.db_connection.rollback()
+
+    def cleanup(self):
+        """Close database connection"""
+        if hasattr(self, 'db_cursor') and self.db_cursor:
+            self.db_cursor.close()
+        if hasattr(self, 'db_connection') and self.db_connection:
+            self.db_connection.close()
 
     def process_frame(self, frame: np.ndarray, frame_id: int) -> Tuple[np.ndarray, Dict]:
         """
@@ -166,13 +302,13 @@ class VehicleSpeedDetector:
                                         if len(self.speeds[track_id]) == len(self.reference_lines) - 1:
                                             avg_speed = sum(self.speeds[track_id].values()) / len(self.speeds[track_id])
                                             self.avg_speeds[track_id] = avg_speed
-                                            # Add to CSV data
-                                            self.csv_data.append({
-                                                'track_id': track_id,
-                                                'speeds': self.speeds[track_id],
-                                                'avg_speed': avg_speed,
-                                                'timestamp': current_time
-                                            })
+                                            # Insert into database instead of CSV
+                                            self.insert_speed_data(
+                                                track_id,
+                                                self.speeds[track_id],
+                                                avg_speed,
+                                                current_time
+                                            )
             
             # Update previous tracks
             self.prev_tracks = current_tracks
@@ -355,26 +491,9 @@ def main():
         cap.release()
         writer.release()
         cv2.destroyAllWindows()
+        detector.cleanup()  # Add cleanup call
         print(f"\nProcessed {processed_count} frames out of {frame_count} total frames")
         print(f"Output saved to: {output_path}")
-
-    # Save CSV data
-    if detector.csv_data:
-        csv_path = args.csv_output
-        with open(csv_path, 'w', newline='') as csvfile:
-            fieldnames = ['track_id', 'timestamp'] + [f'speed_line_{i}' for i in range(1, len(detector.line_distances))] + ['avg_speed']
-            writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
-            writer.writeheader()
-            for data in detector.csv_data:
-                row = {
-                    'track_id': data['track_id'],
-                    'timestamp': data['timestamp']
-                }
-                for line_idx, speed in data['speeds'].items():
-                    row[f'speed_line_{line_idx}'] = speed
-                row['avg_speed'] = data['avg_speed']
-                writer.writerow(row)
-        print(f"Speed data saved to: {csv_path}")
 
 if __name__ == "__main__":
     main() 
