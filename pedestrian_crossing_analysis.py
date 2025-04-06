@@ -1,0 +1,379 @@
+import cv2
+import numpy as np
+from ultralytics import YOLO
+import torch
+from pathlib import Path
+import os
+import time
+from tracker import Sort
+import csv
+from datetime import datetime
+
+class PedestrianAnalyzer:
+    def __init__(self):
+        """Initialize Pedestrian Analyzer"""
+        try:
+            # CHANGE THIS PATH to your model's location
+            self.model_path = r"C:\Ahsan\FYP System\Pipeline Scripts\Ped Work\best(3).pt"
+            if not os.path.exists(self.model_path):
+                raise FileNotFoundError(f"Model file not found at: {self.model_path}")
+            
+            self.model = YOLO(self.model_path)
+            print(f"Model loaded from: {self.model_path}")
+            
+            # Initialize tracker from provided tracker.py
+            self.tracker = Sort(max_age=20, min_hits=3, iou_threshold=0.3)
+            
+            # Store points and lines
+            self.lanes = []  # Will store 3 lanes, each with 4 points
+            self.lane_lines = []  # Will store 9 vertical lines (3 per lane)
+            self.crossing_times = {}  # {track_id: {0: time1, 1: time2, ..., 8: time9}}
+            self.processed_ids = set()  # Keep track of fully processed IDs
+            self.written_ids = set()  # Add this to track which IDs have been written to CSV
+            
+            # Setup CSV logging
+            self.setup_csv_logging()
+            
+            print("Initialization complete.")
+            
+        except Exception as e:
+            print(f"Error during initialization: {str(e)}")
+            raise
+
+    def setup_csv_logging(self):
+        """Setup CSV file for logging crossing times"""
+        os.makedirs('logs', exist_ok=True)
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        self.csv_filename = f'logs/pedestrian_crossings_{timestamp}.csv'
+        
+        # Create headers for all 9 lines
+        headers = ['Pedestrian_ID']
+        for lane in range(3):
+            for line in range(3):
+                headers.append(f'Lane{lane+1}_Line{line+1}_Time')
+        
+        with open(self.csv_filename, 'w', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow(headers)
+        
+        self.csv_rows = {}
+
+    def select_points(self, frame):
+        """Allow user to select points for three lanes"""
+        points = []
+        frame_copy = frame.copy()
+        
+        # Create and setup window properly
+        cv2.namedWindow('Select Points', cv2.WINDOW_NORMAL)
+        cv2.resizeWindow('Select Points', 1920, 1080)
+        cv2.setWindowProperty('Select Points', cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
+        
+        # Define labels for all three lanes
+        lane_labels = [
+            ['Lane1 Top Left', 'Lane1 Top Right', 'Lane1 Bottom Right', 'Lane1 Bottom Left'],
+            ['Lane2 Top Left', 'Lane2 Top Right', 'Lane2 Bottom Right', 'Lane2 Bottom Left'],
+            ['Lane3 Top Left', 'Lane3 Top Right', 'Lane3 Bottom Right', 'Lane3 Bottom Left']
+        ]
+        
+        def mouse_callback(event, x, y, flags, param):
+            if event == cv2.EVENT_LBUTTONDOWN:
+                if len(points) < 12:
+                    points.append((x, y))
+                    
+                    # Create a fresh copy for display
+                    frame_display = frame_copy.copy()
+                    
+                    # Draw all points and lanes
+                    for i, point in enumerate(points):
+                        # Draw point
+                        cv2.circle(frame_display, point, 5, (0, 255, 0), -1)
+                        
+                        # Add label
+                        lane_idx = i // 4
+                        point_idx = i % 4
+                        label = lane_labels[lane_idx][point_idx]
+                        cv2.putText(frame_display, label, 
+                                  (point[0]+10, point[1]), 
+                                  cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+                    
+                    # Draw completed lanes
+                    for lane_idx in range(len(points) // 4):
+                        if (lane_idx + 1) * 4 <= len(points):
+                            lane_points = points[lane_idx*4:(lane_idx+1)*4]
+                            pts = np.array(lane_points, np.int32)
+                            cv2.polylines(frame_display, [pts], True, (0, 255, 0), 2)
+                            
+                            if len(lane_points) == 4:
+                                self.draw_lane_lines(frame_display, lane_points)
+                    
+                    cv2.imshow('Select Points', frame_display)
+        
+        cv2.setMouseCallback('Select Points', mouse_callback)
+        cv2.imshow('Select Points', frame_copy)
+        
+        print("\nSelect 12 points in this order:")
+        for lane in range(3):
+            for label in lane_labels[lane]:
+                print(f"- {label}")
+        
+        while len(points) < 12:
+            if cv2.waitKey(1) & 0xFF == ord('q'):
+                break
+        
+        cv2.destroyAllWindows()
+        self.lanes = [points[i:i+4] for i in range(0, len(points), 4)]
+        
+        # Calculate and store all vertical lines
+        self.calculate_lane_lines()
+        
+        return points
+
+    def calculate_lane_lines(self):
+        """Calculate three vertical lines for each lane"""
+        self.lane_lines = []
+        
+        for lane_points in self.lanes:
+            # Get top and bottom lines of the lane
+            top_line = [lane_points[0], lane_points[1]]
+            bottom_line = [lane_points[3], lane_points[2]]
+            
+            # Calculate three vertical lines (start, middle, end)
+            for t in [0, 0.5, 1]:
+                # Calculate top point
+                top_x = int(top_line[0][0] + t * (top_line[1][0] - top_line[0][0]))
+                top_y = int(top_line[0][1] + t * (top_line[1][1] - top_line[0][1]))
+                
+                # Calculate bottom point
+                bottom_x = int(bottom_line[0][0] + t * (bottom_line[1][0] - bottom_line[0][0]))
+                bottom_y = int(bottom_line[0][1] + t * (bottom_line[1][1] - bottom_line[0][1]))
+                
+                self.lane_lines.append(((top_x, top_y), (bottom_x, bottom_y)))
+
+    def draw_lane_lines(self, frame, lane_points, scale_factor=1):
+        """Draw three vertical lines for a lane"""
+        top_line = [lane_points[0], lane_points[1]]
+        bottom_line = [lane_points[3], lane_points[2]]
+        
+        for t in [0, 0.5, 1]:
+            # Calculate points
+            top_x = int((top_line[0][0] + t * (top_line[1][0] - top_line[0][0])) * scale_factor)
+            top_y = int((top_line[0][1] + t * (top_line[1][1] - top_line[0][1])) * scale_factor)
+            bottom_x = int((bottom_line[0][0] + t * (bottom_line[1][0] - bottom_line[0][0])) * scale_factor)
+            bottom_y = int((bottom_line[0][1] + t * (bottom_line[1][1] - bottom_line[0][1])) * scale_factor)
+            
+            # Draw vertical line
+            cv2.line(frame, (top_x, top_y), (bottom_x, bottom_y), (255, 0, 0), 2)
+
+    def point_to_line_distance(self, point, line_start, line_end):
+        """Calculate distance from point to line segment"""
+        x, y = point
+        x1, y1 = line_start
+        x2, y2 = line_end
+        
+        # Calculate distance
+        numerator = abs((y2-y1)*x - (x2-x1)*y + x2*y1 - y2*x1)
+        denominator = np.sqrt((y2-y1)**2 + (x2-x1)**2)
+        
+        return numerator/denominator if denominator != 0 else float('inf')
+
+    def check_line_crossing(self, point, frame_time):
+        """Check if point crosses any of the nine lines"""
+        threshold = 5  # Distance threshold for line crossing
+        
+        for line_num, line in enumerate(self.lane_lines):
+            distance = self.point_to_line_distance(point, line[0], line[1])
+            if distance < threshold:
+                return line_num
+        return None
+
+    def process_video(self, video_path):
+        """Process video file"""
+        if not os.path.exists(video_path):
+            print(f"Error: Video file not found: {video_path}")
+            return
+        
+        try:
+            print(f"Processing video: {video_path}")
+            cap = cv2.VideoCapture(video_path)
+            if not cap.isOpened():
+                raise ValueError(f"Could not open video file: {video_path}")
+            
+            # Get video properties
+            width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+            height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            fps = int(cap.get(cv2.CAP_PROP_FPS))
+            
+            # Create and setup window properly
+            cv2.namedWindow('Pedestrian Analysis', cv2.WINDOW_NORMAL)
+            cv2.resizeWindow('Pedestrian Analysis', 1920, 1080)
+            cv2.setWindowProperty('Pedestrian Analysis', cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
+            
+            # Read first frame for point selection
+            ret, first_frame = cap.read()
+            if not ret:
+                raise ValueError("Could not read first frame")
+            
+            # Select points
+            self.select_points(first_frame)
+            
+            # Reset video capture
+            cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+            
+            # Create output directory if it doesn't exist
+            os.makedirs('output', exist_ok=True)
+            
+            # Create output video writer
+            output_path = os.path.join('output', f"processed_{os.path.basename(video_path)}")
+            out = cv2.VideoWriter(output_path, cv2.VideoWriter_fourcc(*'mp4v'), fps, (width, height))
+            
+            frame_count = 0
+            
+            while True:
+                ret, frame = cap.read()
+                if not ret:
+                    break
+                
+                # Get current system time
+                current_time = datetime.now().strftime('%I:%M:%S %p')  # 12-hour format with AM/PM
+                
+                # Process detections
+                results = self.model(frame)[0]
+                detections = []
+                
+                for det in results.boxes.data.tolist():
+                    x1, y1, x2, y2, conf, cls = det
+                    
+                    # Filter detections
+                    min_width = 20
+                    min_height = 40
+                    width = x2 - x1
+                    height = y2 - y1
+                    
+                    if (int(cls) == 3 and  # Pedestrian class
+                        conf > 0.3 and     # Confidence threshold
+                        width > min_width and 
+                        height > min_height):
+                        detections.append([x1, y1, x2, y2, 1.0])
+                
+                # Update tracker
+                if len(detections) > 0:
+                    tracks = self.tracker.update(np.array(detections))
+                else:
+                    tracks = np.empty((0, 5))
+                
+                # Process tracks
+                for track in tracks:
+                    track_id = int(track[4])
+                    bbox = track[:4]
+                    mid_x = int((bbox[0] + bbox[2]) / 2)
+                    mid_y = int((bbox[1] + bbox[3]) / 2)
+                    
+                    # Initialize crossing times for new track
+                    if track_id not in self.crossing_times:
+                        self.crossing_times[track_id] = {}
+                    
+                    # Check line crossings
+                    line_crossed = self.check_line_crossing((mid_x, mid_y), current_time)
+                    if line_crossed is not None:
+                        # Record the time for this line crossing
+                        self.crossing_times[track_id][line_crossed] = current_time
+                        print(f"Pedestrian {track_id} crossed line {line_crossed+1} at {current_time}")
+                        
+                        # Write/update CSV after each new crossing
+                        self.write_track_to_csv(track_id)
+                    
+                    # Draw visualization
+                    cv2.rectangle(frame, (int(bbox[0]), int(bbox[1])), 
+                                (int(bbox[2]), int(bbox[3])), (0, 255, 0), 2)
+                    cv2.putText(frame, f"ID:{track_id}", (int(bbox[0]), int(bbox[1])-10),
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+                    cv2.circle(frame, (mid_x, mid_y), 4, (0, 0, 255), -1)
+                
+                # Draw lines
+                for line in self.lane_lines:
+                    cv2.line(frame, line[0], line[1], (255, 0, 0), 2)
+                
+                # Show current system time on frame
+                cv2.putText(frame, f"Time: {current_time}", (10, 30),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+                
+                out.write(frame)
+                cv2.imshow('Pedestrian Analysis', frame)
+                
+                if cv2.waitKey(1) & 0xFF == ord('q'):
+                    print("\nProcessing interrupted by user")
+                    break
+                
+                frame_count += 1
+                if frame_count % 30 == 0:
+                    print(f"Processed {frame_count} frames")
+            
+            # Write any remaining results
+            self.write_results()
+            print(f"\nProcessing complete! Output saved to: {output_path}")
+            
+        except Exception as e:
+            print(f"Error during video processing: {str(e)}")
+            raise
+            
+        finally:
+            if 'cap' in locals():
+                cap.release()
+            if 'out' in locals():
+                out.release()
+            cv2.destroyAllWindows()
+            if hasattr(self, 'csv_file'):
+                self.csv_file.close()
+
+    def write_track_to_csv(self, track_id):
+        """Update track data in memory and write to CSV"""
+        if track_id in self.crossing_times:
+            times = [self.crossing_times[track_id].get(line, "") for line in range(9)]
+            self.csv_rows[track_id] = times
+            
+            with open(self.csv_filename, 'w', newline='') as f:
+                writer = csv.writer(f)
+                # Write header
+                headers = ['Pedestrian_ID']
+                for lane in range(3):
+                    for line in range(3):
+                        headers.append(f'Lane{lane+1}_Line{line+1}_Time')
+                writer.writerow(headers)
+                
+                # Write all rows
+                for id, times in self.csv_rows.items():
+                    writer.writerow([id] + times)
+
+    def write_results(self):
+        """Write final results to CSV"""
+        # Update any remaining unwritten tracks
+        for track_id, crossings in self.crossing_times.items():
+            if track_id not in self.csv_rows:
+                times = [crossings.get(line, "") for line in range(9)]
+                if any(times):  # Only include if at least one time exists
+                    self.csv_rows[track_id] = times
+        
+        # Write final CSV
+        with open(self.csv_filename, 'w', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow(['Pedestrian_ID'] + [f'Lane{lane+1}_Line{line+1}_Time' for lane in range(3) for line in range(3)])
+            for id, times in self.csv_rows.items():
+                writer.writerow([id] + times)
+
+def main():
+    try:
+        # CHANGE THIS PATH to your video's location
+        video_path = r"C:\Ahsan\FYP System\Pipeline Scripts\Ped Work\export6.mp4"
+        
+        if not os.path.exists(video_path):
+            raise FileNotFoundError(f"Video file not found at: {video_path}")
+        
+        analyzer = PedestrianAnalyzer()
+        analyzer.process_video(video_path)
+        
+    except Exception as e:
+        print(f"Error in main: {str(e)}")
+        return
+
+if __name__ == "__main__":
+    main() 

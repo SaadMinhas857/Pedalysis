@@ -240,3 +240,10 @@ def main():
 
 if __name__ == "__main__":
     main() 
+
+
+
+class VehicleSpeedDetector:
+    def __init__(self, model_path: str, conf_threshold: float = 0.5):
+        """
+        Initialize the Vehi

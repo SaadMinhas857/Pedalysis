@@ -7,309 +7,323 @@ import argparse
 from typing import Dict, List, Tuple
 from tracker import Sort
 import math
+import mysql.connector
+from mysql.connector import Error
+from datetime import datetime
+
+DB_CONFIG = {
+    'host': 'localhost',
+    'user': 'Traffic1',
+    'password': 'pedestrian',
+    'database': 'traffic_db'
+}
 
 class PedestrianSpeedDetector:
     def __init__(self, model_path: str, pixels_per_meter: float, conf_threshold: float = 0.5):
         self.model = YOLO(model_path)
         self.conf_threshold = conf_threshold
-        self.pixels_per_meter = pixels_per_meter
+        
+        if pixels_per_meter <= 0:
+            raise ValueError("pixels_per_meter must be positive")
+        self.pixels_per_meter = float(pixels_per_meter)
+        print(f"Conversion factor: {self.pixels_per_meter} pixels/meter")
+        
         self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
         print(f"Using device: {self.device}")
         
-        # Initialize tracker
-        self.tracker = Sort(max_age=20, min_hits=3, iou_threshold=0.3)
-        
         # Store pedestrian tracking data
-        # {track_id: {'positions': [], 'speeds': [], 'times': []}}
         self.pedestrian_tracks = {}
         self.fps = None
-        
-        # Colors for visualization
         self.colors = np.random.randint(0, 255, size=(100, 3))
+        self.speed_data = {}
+        self.video_id = datetime.now().strftime('%Y%m%d_%H%M%S')
+        self.processed_ids = set()
         
-        # Add perspective transform matrix
-        self.perspective_matrix = None
-        self.transformed_size = (1080, 1080)
-        self.transformed_frame = np.zeros((1080, 1080, 3), dtype=np.uint8)
-    
+        # Add trajectory storage
+        self.trajectories = {}  # {track_id: [(x1,y1), (x2,y2), ...]}
+        self.trajectory_colors = {}  # {track_id: color}
+        
+        # Initialize database connection
+        try:
+            self.db_connection = mysql.connector.connect(**DB_CONFIG)
+            self.db_cursor = self.db_connection.cursor()
+            print("Successfully connected to MySQL database")
+            
+            # Setup static data for this video session
+            self.setup_sample_data()
+        except Error as e:
+            print(f"Error connecting to MySQL database: {e}")
+            self.db_connection = None
+            self.db_cursor = None
+
+    def setup_sample_data(self):
+        """Setup static data for the video session"""
+        try:
+            # Static data for the entire video
+            queries = [
+                """INSERT IGNORE INTO location_dimension 
+                   (location_key, metro_city_province, district, neighborhood, spot) 
+                   VALUES (1, 'Sample City', 'Sample District', 'Sample Area', 'Sample Spot')""",
+                
+                """INSERT IGNORE INTO road_character_dimension 
+                   (road_key, road_type, road_feature) 
+                   VALUES (1, 'Sample Road Type', 'Sample Feature')""",
+                
+                """INSERT IGNORE INTO behavior_feature 
+                   (behavior_id, behavior_feature) 
+                   VALUES (1, 'speed')"""
+            ]
+            
+            for query in queries:
+                self.db_cursor.execute(query)
+            self.db_connection.commit()
+            print("Static video data setup complete")
+        except Error as e:
+            print(f"Error setting up static data: {e}")
+
+    def insert_transformed_speed(self, track_id: int, speed: float):
+        """Insert speed data with duplicate handling"""
+        if not hasattr(self, 'db_cursor') or self.db_cursor is None:
+            print("Database connection not available")
+            return
+        
+        try:
+            if not self.db_connection.is_connected():
+                print("Reconnecting to database...")
+                self.db_connection.reconnect()
+                self.db_cursor = self.db_connection.cursor()
+
+            # First check if this ID already exists
+            check_query = "SELECT time_key FROM time_dimension WHERE time_key = %s"
+            self.db_cursor.execute(check_query, (track_id,))
+            if self.db_cursor.fetchone():
+                print(f"ID {track_id} already exists in database, skipping...")
+                return
+
+            current_time = datetime.now()
+            
+            # Insert time dimension
+            time_query = """
+            INSERT INTO time_dimension 
+            (time_key, week, day, day_night, hour) 
+            VALUES (%s, %s, %s, %s, %s)
+            """
+            time_key = track_id
+            week = f"Week{current_time.strftime('%V')}"
+            day = current_time.strftime('%A')
+            day_night = 'Day' if 6 <= current_time.hour <= 18 else 'Night'
+            hour = current_time.strftime('%Y-%m-%d')
+            
+            self.db_cursor.execute(time_query, (time_key, week, day, day_night, hour))
+
+            # Insert scene dimension
+            scene_query = """
+            INSERT INTO scene_dimension 
+            (scene_key, object_type, event_type) 
+            VALUES (%s, %s, %s)
+            """
+            self.db_cursor.execute(scene_query, (track_id, 'pedestrian', 'movement'))
+
+            # Insert fact table
+            fact_query = """
+            INSERT INTO fact_table 
+            (time_key, location_key, road_key, scene_key, scene_ratio, video_code) 
+            VALUES (%s, %s, %s, %s, %s, %s)
+            """
+            self.db_cursor.execute(fact_query, (
+                time_key, 1, 1, track_id, 1.0, f"video_{self.video_id}_{track_id}"
+            ))
+
+            # Insert speed data
+            behavior_query = """
+            INSERT INTO scene_behavior_feature 
+            (scene_key, object_type, behavior_id, behavior_value) 
+            VALUES (%s, %s, %s, %s)
+            """
+            self.db_cursor.execute(behavior_query, (
+                track_id, 'pedestrian', 1, speed
+            ))
+
+            self.db_connection.commit()
+            print(f"Successfully inserted speed data for pedestrian {track_id}: {speed:.2f} m/s")
+            
+        except Error as e:
+            print(f"Error inserting speed data: {str(e)}")
+            self.db_connection.rollback()
+
     def calculate_speed(self, positions: List[Tuple[float, float]], times: List[float]) -> float:
         """Calculate speed in meters per second using last N positions"""
-        if len(positions) < 2:
-            return 0.0
-        
-        # Use last 5 positions or all if less
-        n_positions = min(5, len(positions))
-        recent_positions = positions[-n_positions:]
-        recent_times = times[-n_positions:]
-        
-        # Calculate total distance in pixels
-        total_distance = 0
-        for i in range(1, len(recent_positions)):
-            dx = recent_positions[i][0] - recent_positions[i-1][0]
-            dy = recent_positions[i][1] - recent_positions[i-1][1]
-            total_distance += math.sqrt(dx*dx + dy*dy)
-        
-        # Convert distance to meters
-        distance_meters = total_distance / self.pixels_per_meter
-        
-        # Calculate time difference
-        time_diff = recent_times[-1] - recent_times[0]
-        
-        if time_diff > 0:
-            speed = distance_meters / time_diff
-            return speed
-        return 0.0
-
-    def select_transform_points(self, frame):
-        """Allow user to select four points for perspective transform"""
-        points = []
-        frame_copy = frame.copy()
-        
-        def mouse_callback(event, x, y, flags, param):
-            if event == cv2.EVENT_LBUTTONDOWN and len(points) < 4:
-                points.append((x, y))
-                # Draw point
-                cv2.circle(frame_copy, (x, y), 5, (0, 255, 0), -1)
-                cv2.putText(frame_copy, str(len(points)), (x+10, y+10),
-                           cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
-                if len(points) > 1:
-                    # Draw lines connecting points
-                    cv2.line(frame_copy, points[-2], points[-1], (0, 255, 0), 2)
-                if len(points) == 4:
-                    # Connect last point to first point
-                    cv2.line(frame_copy, points[-1], points[0], (0, 255, 0), 2)
-                cv2.imshow('Select Transform Points', frame_copy)
-
-        cv2.namedWindow('Select Transform Points')
-        cv2.setMouseCallback('Select Transform Points', mouse_callback)
-        
-        print("\nSelect 4 points for perspective transform in this order:")
-        print("1. Top-left")
-        print("2. Top-right")
-        print("3. Bottom-right")
-        print("4. Bottom-left")
-        
-        while len(points) < 4:
-            cv2.imshow('Select Transform Points', frame_copy)
-            if cv2.waitKey(1) & 0xFF == ord('q'):
-                break
-        
-        cv2.destroyWindow('Select Transform Points')
-        
-        if len(points) == 4:
-            # Define destination points for 1080x1080 frame
-            dst_points = np.float32([
-                [0, 0],  # Top-left
-                [1080, 0],  # Top-right
-                [1080, 1080],  # Bottom-right
-                [0, 1080]  # Bottom-left
-            ])
-            
-            # Calculate perspective transform matrix
-            src_points = np.float32(points)
-            self.perspective_matrix = cv2.getPerspectiveTransform(src_points, dst_points)
-            return True
-        return False
-
-    def transform_point(self, point):
-        """Transform a single point using perspective matrix"""
-        if self.perspective_matrix is None:
-            return point
-        
-        transformed = cv2.perspectiveTransform(
-            np.array([[point]], dtype=np.float32),
-            self.perspective_matrix
-        )
-        return (int(transformed[0][0][0]), int(transformed[0][0][1]))
-
-    def transform_bbox(self, bbox):
-        """Transform bounding box coordinates using perspective matrix"""
-        if self.perspective_matrix is None:
-            return bbox
-        
-        # Get bottom center of bounding box (feet position)
-        foot_point = (int((bbox[0] + bbox[2]) / 2), int(bbox[3]))
-        
-        # Transform foot point
-        transformed_foot = self.transform_point(foot_point)
-        
-        # Create a small box around the transformed point
-        box_size = 30  # Size of box in transformed view
-        x1 = transformed_foot[0] - box_size//2
-        y1 = transformed_foot[1] - box_size
-        x2 = transformed_foot[0] + box_size//2
-        y2 = transformed_foot[1]
-        
-        return [x1, y1, x2, y2]
-
-    def process_frame(self, frame: np.ndarray, frame_id: int) -> Tuple[np.ndarray, np.ndarray, Dict]:
         try:
-            # Run YOLOv8 inference on original frame
+            if len(positions) < 2 or len(times) < 2:
+                print(f"Not enough data points: positions={len(positions)}, times={len(times)}")
+                return 0.0
+            
+            # Use last 5 positions or all if less
+            n_positions = min(5, len(positions))
+            recent_positions = positions[-n_positions:]
+            recent_times = times[-n_positions:]
+            
+            # Calculate total distance in pixels
+            total_distance = 0
+            for i in range(1, len(recent_positions)):
+                dx = recent_positions[i][0] - recent_positions[i-1][0]
+                dy = recent_positions[i][1] - recent_positions[i-1][1]
+                distance = math.sqrt(dx*dx + dy*dy)
+                total_distance += distance
+            
+            # Convert distance to meters
+            distance_meters = total_distance / self.pixels_per_meter
+            
+            # Calculate time difference
+            time_diff = recent_times[-1] - recent_times[0]
+            
+            if time_diff > 0:
+                speed = distance_meters / time_diff
+                print(f"Speed calculation: distance={distance_meters:.2f}m, time={time_diff:.2f}s, speed={speed:.2f}m/s")
+                return speed
+            else:
+                print(f"Invalid time difference: {time_diff}")
+                return 0.0
+            
+        except Exception as e:
+            print(f"Error in speed calculation: {e}")
+            return 0.0
+
+    def draw_trajectories(self, frame):
+        """Draw all trajectories on the frame"""
+        for track_id, trajectory in self.trajectories.items():
+            if len(trajectory) < 2:
+                continue
+                
+            # Get color for this track
+            if track_id not in self.trajectory_colors:
+                self.trajectory_colors[track_id] = self.colors[track_id % len(self.colors)].tolist()
+            color = self.trajectory_colors[track_id]
+            
+            # Draw trajectory line
+            points = np.array(trajectory, dtype=np.int32)
+            cv2.polylines(frame, [points], False, color, 2)
+            
+            # Draw speed if available
+            if track_id in self.pedestrian_tracks and self.pedestrian_tracks[track_id]['speeds']:
+                speed = self.pedestrian_tracks[track_id]['speeds'][-1]
+                last_point = trajectory[-1]
+                cv2.putText(frame,
+                           f"{speed:.2f} m/s",
+                           (last_point[0] + 10, last_point[1]),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
+        return frame
+
+    def process_frame(self, frame: np.ndarray, frame_id: int, tracker: Sort) -> Tuple[np.ndarray, Dict]:
+        try:
+            current_time = frame_id / self.fps if self.fps else 0
             results = self.model(frame)[0]
-            
-            # Create original visualization frame
-            original_frame = frame.copy()
-            
-            # Transform the frame to bird's eye view
-            transformed_frame = cv2.warpPerspective(
-                frame, 
-                self.perspective_matrix, 
-                self.transformed_size
-            )
-            self.transformed_frame = transformed_frame
             
             # Process detections
             detections = []
-            transformed_detections = []
             for det in results.boxes.data.tolist():
                 x1, y1, x2, y2, conf, cls = det
-                if conf >= self.conf_threshold and int(cls) == 2:
-                    # Store original detection
+                if conf >= self.conf_threshold and int(cls) == 3:  # class 3 is person
                     detections.append([x1, y1, x2, y2, conf])
-                    
-                    # Transform detection for bird's eye view
-                    transformed_bbox = self.transform_bbox([x1, y1, x2, y2])
-                    transformed_detections.append(transformed_bbox + [conf])
             
-            # Update trackers
-            if len(detections) > 0:
-                original_tracks = self.tracker.update(np.array(detections))
-                transformed_tracks = self.tracker.update(np.array(transformed_detections))
+            # Update tracker with current detections
+            if detections:
+                tracks = tracker.update(np.array(detections))
             else:
-                original_tracks = np.empty((0, 5))
-                transformed_tracks = np.empty((0, 5))
+                tracks = np.empty((0, 5))
             
-            current_time = frame_id / self.fps if self.fps else 0
-            
-            # Process original view tracks
-            for track in original_tracks:
+            # Process each track
+            for track in tracks:
                 track_id = int(track[4])
                 bbox = track[:4]
                 center_x = int((bbox[0] + bbox[2]) / 2)
-                center_y = int((bbox[1] + bbox[3]) / 2)
+                center_y = int(bbox[3])  # Use bottom center
+                center = (center_x, center_y)
                 
-                # Initialize track data if new
+                # Update trajectory
+                if track_id not in self.trajectories:
+                    self.trajectories[track_id] = []
+                self.trajectories[track_id].append(center)
+                
+                # Limit trajectory length
+                max_trajectory_length = 50
+                if len(self.trajectories[track_id]) > max_trajectory_length:
+                    self.trajectories[track_id] = self.trajectories[track_id][-max_trajectory_length:]
+                
+                # Skip if already processed
+                if track_id in self.processed_ids:
+                    continue
+                
+                # Initialize or update track data
                 if track_id not in self.pedestrian_tracks:
                     self.pedestrian_tracks[track_id] = {
                         'positions': [],
-                        'transformed_positions': [],
                         'speeds': [],
-                        'transformed_speeds': [],
-                        'times': []
+                        'times': [],
+                        'last_update': current_time
                     }
                 
-                # Update track data for original view
                 track_data = self.pedestrian_tracks[track_id]
-                track_data['positions'].append((center_x, center_y))
-                track_data['times'].append(current_time)
                 
-                # Calculate speed using original positions only
-                current_speed = self.calculate_speed(
-                    track_data['positions'],
-                    track_data['times']
-                )
-                track_data['speeds'].append(current_speed)
+                # Update position data
+                if current_time - track_data['last_update'] > 0.1:  # Update every 0.1 seconds
+                    track_data['positions'].append(center)
+                    track_data['times'].append(current_time)
+                    track_data['last_update'] = current_time
                 
-                # Get color for this track
+                    # Calculate speed if we have enough data points
+                    if len(track_data['positions']) >= 5:
+                        speed = self.calculate_speed(
+                            track_data['positions'][-5:],
+                            track_data['times'][-5:]
+                        )
+                        
+                        if speed > 0 and speed < 10:  # reasonable speed range
+                            track_data['speeds'].append(speed)
+                            
+                            # Process if we have consistent tracking
+                            if len(track_data['speeds']) >= 3:
+                                avg_speed = np.mean(track_data['speeds'][-3:])
+                                if track_id not in self.processed_ids:
+                                    self.insert_transformed_speed(track_id, avg_speed)
+                                    self.processed_ids.add(track_id)
+                                    print(f"Processed pedestrian {track_id}: {avg_speed:.2f} m/s")
+                
+                # Visualization
                 color = self.colors[track_id % len(self.colors)]
-                color = (int(color[0]), int(color[1]), int(color[2]))
-                
-                # Draw on original frame
-                cv2.rectangle(original_frame, 
+                cv2.rectangle(frame, 
                             (int(bbox[0]), int(bbox[1])), 
                             (int(bbox[2]), int(bbox[3])), 
                             color, 2)
                 
-                # Draw trajectory on original frame
-                positions = track_data['positions']
-                for i in range(1, len(positions)):
-                    pt1 = positions[i-1]
-                    pt2 = positions[i]
-                    thickness = int(2 + (i / len(positions)) * 3)
-                    cv2.line(original_frame, pt1, pt2, color, thickness)
+                status = "PROCESSED" if track_id in self.processed_ids else "TRACKING"
+                if track_id in self.pedestrian_tracks and self.pedestrian_tracks[track_id]['speeds']:
+                    speed = self.pedestrian_tracks[track_id]['speeds'][-1]
+                    status = f"{status} {speed:.2f}m/s"
                 
-                # Draw ID and original speed only in original view
-                cv2.circle(original_frame, (center_x, center_y), 5, color, -1)
-                speed_text = f"ID:{track_id} {current_speed:.1f} m/s"
-                cv2.putText(original_frame, speed_text,
-                           (int(bbox[0]), int(bbox[1]-10)),
+                cv2.putText(frame, 
+                           f"ID:{track_id} ({status})",
+                           (center_x, center_y - 10),
                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
             
-            # Process transformed view tracks
-            for track in transformed_tracks:
-                track_id = int(track[4])
-                bbox = track[:4]
-                center_x = int((bbox[0] + bbox[2]) / 2)
-                center_y = int(bbox[3])  # Use bottom of box
-                transformed_center = (center_x, center_y)
-                
-                # Get or initialize track data
-                if track_id not in self.pedestrian_tracks:
-                    self.pedestrian_tracks[track_id] = {
-                        'positions': [],
-                        'transformed_positions': [],
-                        'speeds': [],
-                        'transformed_speeds': [],
-                        'times': []
-                    }
-                
-                track_data = self.pedestrian_tracks[track_id]
-                track_data['transformed_positions'].append(transformed_center)
-                
-                # Calculate speed using transformed positions only
-                transformed_speed = self.calculate_speed(
-                    track_data['transformed_positions'],
-                    track_data['times']
-                )
-                track_data['transformed_speeds'].append(transformed_speed)
-                
-                # Get color for this track
-                color = self.colors[track_id % len(self.colors)]
-                color = (int(color[0]), int(color[1]), int(color[2]))
-                
-                # Draw bounding box on transformed frame
-                cv2.rectangle(self.transformed_frame, 
-                            (int(bbox[0]), int(bbox[1])), 
-                            (int(bbox[2]), int(bbox[3])), 
-                            color, 2)
-                
-                # Draw trajectory on transformed frame
-                positions = track_data['transformed_positions']
-                for i in range(1, len(positions)):
-                    pt1 = positions[i-1]
-                    pt2 = positions[i]
-                    thickness = int(2 + (i / len(positions)) * 3)
-                    cv2.line(self.transformed_frame, pt1, pt2, color, thickness)
-                
-                # Draw ID and transformed speed only in transformed view
-                cv2.circle(self.transformed_frame, transformed_center, 8, color, -1)
-                speed_text = f"ID:{track_id} {transformed_speed:.1f} m/s"
-                cv2.putText(self.transformed_frame, speed_text,
-                           (transformed_center[0], transformed_center[1] - 10),
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
+            # Draw all trajectories
+            frame = self.draw_trajectories(frame)
             
-            # Add frame info to both views
-            for frame_view, view_type, num_tracks in [
-                (original_frame, "Original", len(original_tracks)),
-                (self.transformed_frame, "Bird's Eye", len(transformed_tracks))
-            ]:
-                info_bg = frame_view.copy()
-                cv2.rectangle(info_bg, (5, 5), (250, 70), (255, 255, 255), -1)
-                cv2.addWeighted(info_bg, 0.6, frame_view, 0.4, 0, frame_view)
-                
-                cv2.putText(frame_view, f"{view_type} View - Frame: {frame_id}", (10, 30),
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 0), 2)
-                cv2.putText(frame_view, f"Tracked: {num_tracks}", (10, 60),
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 0), 2)
-            
-            return original_frame, self.transformed_frame, {
-                'tracks': original_tracks.tolist() if len(original_tracks) > 0 else [],
+            return frame, {
+                'tracks': tracks.tolist() if len(tracks) > 0 else [],
                 'pedestrian_tracks': self.pedestrian_tracks
             }
             
         except Exception as e:
             print(f"Error processing frame {frame_id}: {str(e)}")
-            return frame, self.transformed_frame, {'tracks': [], 'pedestrian_tracks': {}}
+            return frame, {'tracks': [], 'pedestrian_tracks': {}}
+
+    def cleanup(self):
+        """Close database connection"""
+        if hasattr(self, 'db_cursor') and self.db_cursor:
+            self.db_cursor.close()
+        if hasattr(self, 'db_connection') and self.db_connection:
+            self.db_connection.close()
 
 def main():
     parser = argparse.ArgumentParser(description='Pedestrian Speed Detection using YOLOv8')
@@ -317,97 +331,72 @@ def main():
     parser.add_argument('--source', type=str, required=True, help='Path to input video file')
     parser.add_argument('--pixels-per-meter', type=float, required=True, help='Pixels per meter conversion factor')
     parser.add_argument('--conf-thres', type=float, default=0.5, help='Confidence threshold')
-    parser.add_argument('--output', type=str, default='output_speed.mp4', help='Path to output video')
-    parser.add_argument('--display', action='store_true', help='Display output in real-time')
+    parser.add_argument('--display', action='store_true', help='Enable display window')
     args = parser.parse_args()
     
-    # Initialize detector
-    detector = PedestrianSpeedDetector(args.model, args.pixels_per_meter, args.conf_thres)
+    # Initialize detector and tracker
+    detector = PedestrianSpeedDetector(
+        args.model, 
+        args.pixels_per_meter, 
+        args.conf_thres
+    )
     
-    # Open video capture
+    tracker = Sort(max_age=15, min_hits=5, iou_threshold=0.5)
+    
     cap = cv2.VideoCapture(args.source)
     if not cap.isOpened():
         raise ValueError(f"Error opening video file: {args.source}")
     
-    # Read first frame for perspective transform setup
-    ret, first_frame = cap.read()
-    if not ret:
-        raise ValueError("Could not read first frame")
-    
-    # Select transform points
-    if not detector.select_transform_points(first_frame):
-        raise ValueError("Failed to select transform points")
-    
-    # Reset video capture
-    cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-    
-    # Get video properties
-    frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     fps = int(cap.get(cv2.CAP_PROP_FPS))
-    detector.fps = fps
-    
-    # Initialize video writer for both views
-    original_output_path = Path('output_original.mp4')
-    transformed_output_path = Path('output_transformed.mp4')
-    
-    original_writer = cv2.VideoWriter(
-        str(original_output_path),
-        cv2.VideoWriter_fourcc(*'mp4v'),
-        fps,
-        (frame_width, frame_height)
-    )
-    
-    transformed_writer = cv2.VideoWriter(
-        str(transformed_output_path),
-        cv2.VideoWriter_fourcc(*'mp4v'),
-        fps,
-        (1080, 1080)
-    )
+    detector.fps = fps if fps > 0 else 30
     
     frame_count = 0
     try:
+        # Get first frame to set up display window
+        ret, frame = cap.read()
+        if ret:
+            # Create window with a reasonable size
+            cv2.namedWindow('Pedestrian Tracking', cv2.WINDOW_NORMAL)
+            height, width = frame.shape[:2]
+            cv2.resizeWindow('Pedestrian Tracking', width, height)
+        
+        # Reset video
+        cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+        
         while cap.isOpened():
             ret, frame = cap.read()
             if not ret:
                 break
             
-            # Process frame
-            original_frame, transformed_frame, results = detector.process_frame(frame, frame_count)
+            print(f"\nProcessing frame {frame_count + 1}")
+            processed_frame, results = detector.process_frame(frame, frame_count, tracker)
             
-            # Write frames
-            original_writer.write(original_frame)
-            transformed_writer.write(transformed_frame)
-            
-            # Display frames if requested
             if args.display:
-                cv2.imshow('Original View', original_frame)
-                cv2.imshow('Transformed View', transformed_frame)
-                if cv2.waitKey(1) & 0xFF == ord('q'):
+                cv2.imshow('Pedestrian Tracking', processed_frame)
+                # Add a longer wait time to make the display more visible
+                key = cv2.waitKey(30) & 0xFF  # Changed from 1 to 30
+                if key == ord('q'):
+                    print("\nStopped by user")
                     break
             
             frame_count += 1
-            
+        
+        print("\n=== Final Summary ===")
+        print(f"Total unique pedestrians processed: {len(detector.processed_ids)}")
+        print("\nProcessed Pedestrian IDs and their speeds:")
+        for ped_id in detector.processed_ids:
+            track_data = detector.pedestrian_tracks[ped_id]
+            if track_data['speeds']:
+                speed = track_data['speeds'][-1]
+                print(f"Pedestrian {ped_id}: {speed:.2f} m/s ({speed * 3.6:.2f} km/h)")
+        
+    except Exception as e:
+        print(f"Error in main loop: {e}")
     finally:
         cap.release()
-        original_writer.release()
-        transformed_writer.release()
         cv2.destroyAllWindows()
-        
-        # Print final statistics
-        print("\nPedestrian Speed Statistics:")
-        for ped_id, track_data in detector.pedestrian_tracks.items():
-            speeds = track_data['speeds']
-            if speeds:
-                avg_speed = sum(speeds) / len(speeds)
-                max_speed = max(speeds)
-                print(f"\nPedestrian {ped_id}:")
-                print(f"  Average Speed: {avg_speed:.2f} m/s")
-                print(f"  Maximum Speed: {max_speed:.2f} m/s")
-        
-        print(f"\nProcessed {frame_count} frames")
-        print(f"Original view saved to: {original_output_path}")
-        print(f"Transformed view saved to: {transformed_output_path}")
+        detector.cleanup()
+        print("\nProgram terminated")
 
 if __name__ == "__main__":
     main() 
