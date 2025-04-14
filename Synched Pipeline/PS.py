@@ -44,50 +44,76 @@ class PedestrianSpeedDetector:
             raise
 
     def process_frame(self, frame, tracks, frame_time):
-        """Process a frame and return annotated frame"""
-        # Create copy of frame for drawing
+        """Process a frame with tracked objects"""
         processed_frame = frame.copy()
         
-        # Process tracks
+        # Process each track
         for track in tracks:
-            track_id = int(track[4])  # Use the ID passed from the pipeline
+            track_id = int(track[4])
             bbox = track[:4]
-            center_x = int((bbox[0] + bbox[2]) / 2)
-            center_y = int((bbox[1] + bbox[3]) / 2)
+            center = (int((bbox[0] + bbox[2]) / 2), int((bbox[1] + bbox[3]) / 2))
             
-            # Update track history
+            # Record position and time
             if track_id not in self.track_history:
                 self.track_history[track_id] = []
-            
-            self.track_history[track_id].append((center_x, center_y, frame_time))
-            
-            # Keep only last 30 positions for speed calculation
-            if len(self.track_history[track_id]) > 30:
-                self.track_history[track_id].pop(0)
+            self.track_history[track_id].append((center, frame_time))
             
             # Calculate speed if we have enough history
             if len(self.track_history[track_id]) >= 2:
-                current_speed = self.calculate_speed(track_id)
+                # Get positions and times
+                pos1, time1 = self.track_history[track_id][-2]
+                pos2, time2 = self.track_history[track_id][-1]
                 
-                # Store speed
-                if track_id not in self.speeds:
-                    self.speeds[track_id] = []
-                self.speeds[track_id].append(current_speed)
+                # Calculate distance in pixels
+                distance_px = np.sqrt((pos2[0] - pos1[0])**2 + (pos2[1] - pos1[1])**2)
                 
-                # Write to CSV if we have enough speeds
-                if len(self.speeds[track_id]) >= 10:
-                    self.write_speed_to_csv(track_id)
+                # Convert to meters
+                distance_m = distance_px / self.pixels_per_meter
                 
-                # Draw speed on frame
-                cv2.putText(processed_frame, f"{current_speed:.1f} m/s", 
-                           (int(bbox[0]), int(bbox[3])+20),
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+                # Calculate time difference
+                time_diff = time2 - time1
+                
+                if time_diff > 0:
+                    # Calculate speed in km/h
+                    speed = (distance_m / time_diff) * 3.6
+                    
+                    # Store speed in track history
+                    if track_id not in self.speeds:
+                        self.speeds[track_id] = []
+                    self.speeds[track_id].append(speed)
+                    
+                    # Calculate average speed
+                    avg_speed = sum(self.speeds[track_id]) / len(self.speeds[track_id])
+                    
+                    # Store in database
+                    speed_data = {
+                        6: avg_speed  # Behavior ID 6 is for pedestrian speed
+                    }
+                    self.pipeline.insert_track_data(track_id, 'pedestrian', speed_data)
+                    
+                    # Draw speed on frame
+                    cv2.putText(processed_frame,
+                              f"Speed: {avg_speed:.1f} km/h",
+                              (int(bbox[0]), int(bbox[1]) - 10),
+                              cv2.FONT_HERSHEY_SIMPLEX,
+                              0.7,
+                              (0, 255, 0),
+                              2)
             
             # Draw bounding box and ID
-            cv2.rectangle(processed_frame, (int(bbox[0]), int(bbox[1])), 
-                         (int(bbox[2]), int(bbox[3])), (0, 255, 0), 2)
-            cv2.putText(processed_frame, f"ID:{track_id}", (int(bbox[0]), int(bbox[1])-10),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+            cv2.rectangle(processed_frame,
+                        (int(bbox[0]), int(bbox[1])),
+                        (int(bbox[2]), int(bbox[3])),
+                        (0, 255, 0),
+                        2)
+            
+            cv2.putText(processed_frame,
+                       f"ID: {track_id}",
+                       (int(bbox[0]), int(bbox[1]) - 30),
+                       cv2.FONT_HERSHEY_SIMPLEX,
+                       0.7,
+                       (0, 255, 0),
+                       2)
         
         return processed_frame
 

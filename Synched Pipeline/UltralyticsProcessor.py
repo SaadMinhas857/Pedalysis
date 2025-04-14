@@ -148,33 +148,87 @@ class UltralyticsProcessor:
         return ccw(prev_pos, p1, p2) != ccw(curr_pos, p1, p2) and \
                ccw(prev_pos, curr_pos, p1) != ccw(prev_pos, curr_pos, p2)
 
-    def process_frame(self, frame, tracks, visible_ids=None):
-        """Process frame with tracked objects"""
-        frame_with_detections = frame.copy()
+    def process_frame(self, frame, vehicle_tracks, visible_ids):
+        """Process a frame with tracked objects"""
+        processed_frame = frame.copy()
         
-        # Draw reference line if available
+        # Draw reference line if it exists
         if hasattr(self, 'reference_line'):
             p1, p2 = self.reference_line
-            cv2.line(frame_with_detections, p1, p2, (0, 255, 255), 2)
-            cv2.putText(frame_with_detections, "Speed Measurement Line", 
+            cv2.line(processed_frame, p1, p2, (0, 255, 255), 2)
+            cv2.putText(processed_frame, "Speed Measurement Line", 
                        (p1[0], p1[1] - 10),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+                       cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0, 255, 255), 3)
+            
+            # Draw additional reference lines
+            if hasattr(self, 'reference_lines'):
+                colors = [(0, 255, 0), (255, 128, 0), (255, 0, 0)]  # Green, Orange, Red
+                labels = ["15m Line", "10m Line", "5m Line"]
+                for i, (line, color, label) in enumerate(zip(self.reference_lines, colors, labels)):
+                    p1, p2 = line
+                    cv2.line(processed_frame, p1, p2, color, 2)
+                    cv2.putText(processed_frame, label, 
+                               (p1[0], p1[1] - 10),
+                               cv2.FONT_HERSHEY_SIMPLEX, 1.5, color, 3)
         
         # Process each track
-        for track in tracks:
-            x1, y1, x2, y2, track_id = track
+        for track in vehicle_tracks:
+            track_id = int(track[4])
             
-            # Only draw if the track_id is in visible_ids
-            if visible_ids is None or track_id in visible_ids:
-                # Draw bounding box
-                cv2.rectangle(frame_with_detections, (int(x1), int(y1)), (int(x2), int(y2)), (0, 255, 0), 2)
+            # Skip if not in visible IDs
+            if track_id not in visible_ids:
+                continue
+            
+            # Get track position
+            x1, y1, x2, y2 = map(int, track[:4])
+            center = (int((x1 + x2) / 2), int((y1 + y2) / 2))
+            
+            # Draw bounding box and ID
+            cv2.rectangle(processed_frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+            cv2.putText(processed_frame, f"ID: {track_id}", 
+                       (x1, y1 - 10),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 0), 2)
+            
+            # Get speeds from vehicle_speeds dictionary
+            if hasattr(self, 'vehicle_speeds') and track_id in self.vehicle_speeds:
+                speeds = self.vehicle_speeds[track_id]
                 
-                # Draw ID
-                cv2.putText(frame_with_detections, f"#{int(track_id)}", 
-                           (int(x1), int(y1) - 5),
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-            
-        return frame_with_detections
+                # Calculate average speed if we have all measurements
+                if len(speeds) >= 4:  # We have speeds for all lines
+                    avg_speed = sum(speeds.values()) / len(speeds)
+                    
+                    # Store speeds in database
+                    speed_data = {
+                        1: speeds.get('main', 0),  # Reference line speed
+                        2: speeds.get('5m', 0),    # 5m line speed
+                        3: speeds.get('10m', 0),   # 10m line speed
+                        4: speeds.get('15m', 0),   # 15m line speed
+                        5: avg_speed               # Average speed
+                    }
+                    
+                    # Get vehicle class
+                    if hasattr(self.pipeline, 'vehicle_classes') and track_id in self.pipeline.vehicle_classes:
+                        class_id = self.pipeline.vehicle_classes[track_id]
+                    else:
+                        class_id = None
+                    
+                    # Insert data into database
+                    self.pipeline.insert_track_data(track_id, 'vehicle', speed_data, class_id)
+                    
+                    # Draw speeds on frame
+                    y_offset = y1 - 30
+                    for line_key, speed in speeds.items():
+                        cv2.putText(processed_frame, f"{line_key}: {speed:.1f} km/h",
+                                  (x1, y_offset),
+                                  cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+                        y_offset -= 20
+                    
+                    # Draw average speed
+                    cv2.putText(processed_frame, f"Avg: {avg_speed:.1f} km/h",
+                              (x1, y_offset),
+                              cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+        
+        return processed_frame
     
     def save_results_to_csv(self):
         """Save results to CSV file"""

@@ -2,7 +2,7 @@ import cv2
 import numpy as np
 from ultralytics import YOLO
 import os
-from datetime import datetime
+from datetime import datetime, timedelta
 from PCA import PedestrianCrossingAnalyzer
 from PS import PedestrianSpeedDetector
 from CARPSM import CarPSMDetector
@@ -12,6 +12,54 @@ import csv
 from tracker import Sort
 import supervision as sv
 from collections import defaultdict, deque
+import mysql.connector
+from mysql.connector import Error
+import xml.etree.ElementTree as ET
+
+# Add DB configuration
+DB_CONFIG = {
+    'host': 'localhost',
+    'user': 'Traffic1',
+    'password': 'pedestrian',
+    'database': 'traffic_db'
+}
+
+def read_time_from_xml(xml_file_path='D:\\fydp final\\ijp\\C0043M01.XML', frame_count=0, fps=25):
+    """Read time from XML file and adjust by frame count"""
+    try:
+        # Check if XML file exists
+        if not os.path.exists(xml_file_path):
+            print(f"XML file not found: {xml_file_path}. Using system time instead.")
+            return datetime.now()
+        
+        # Parse XML file
+        tree = ET.parse(xml_file_path)
+        root = tree.getroot()
+        
+        # Find CreationDate element and get its value attribute
+        creation_date = root.find('.//{*}CreationDate')
+        if creation_date is None or 'value' not in creation_date.attrib:
+            print("CreationDate not found in XML. Using system time instead.")
+            return datetime.now()
+        
+        # Get the timestamp string from the value attribute
+        timestamp_str = creation_date.get('value')
+        
+        # Parse the ISO 8601 format timestamp
+        # Remove timezone info as it's not needed for our purposes
+        timestamp_str = timestamp_str.split('+')[0]
+        base_time = datetime.strptime(timestamp_str, '%Y-%m-%dT%H:%M:%S')
+        
+        # Calculate time offset based on frame count and FPS
+        seconds_offset = frame_count / fps
+        time_delta = timedelta(seconds=seconds_offset)
+        xml_time = base_time + time_delta
+        
+        return xml_time
+        
+    except Exception as e:
+        print(f"Error reading time from XML: {e}. Using system time instead.")
+        return datetime.now()
 
 class ViewTransformer:
     def __init__(self, source: np.ndarray, target: np.ndarray) -> None:
@@ -39,9 +87,33 @@ class PedestrianPipeline:
             self.pixels_per_meter = pixels_per_meter
             self.conf_threshold = conf_threshold
             
+            # Get number of lanes from user if PCA is enabled
+            self.num_lanes = None
+            if self.processors['PCA']:
+                while True:
+                    try:
+                        self.num_lanes = int(input("Enter the number of lanes (minimum 1): "))
+                        if self.num_lanes >= 1:
+                            break
+                        print("Please enter a number greater than or equal to 1")
+                    except ValueError:
+                        print("Please enter a valid number")
+            
             # Initialize YOLO model
             self.model = YOLO(model_path)
             print(f"Model loaded from: {model_path}")
+            
+            # Initialize database connection
+            self.video_id = datetime.now().strftime('%Y%m%d_%H%M%S')
+            try:
+                self.db_connection = mysql.connector.connect(**DB_CONFIG)
+                self.db_cursor = self.db_connection.cursor()
+                print("Successfully connected to MySQL database")
+                self.setup_database_tables()
+            except Error as e:
+                print(f"Error connecting to MySQL database: {e}")
+                self.db_connection = None
+                self.db_cursor = None
             
             # Initialize separate trackers for pedestrians and vehicles
             self.ped_tracker = Sort(
@@ -98,10 +170,11 @@ class PedestrianPipeline:
             if self.processors['PS']:
                 print(f"Pedestrian analysis CSV: {self.ped_csv}")
                 self.speed_detector = PedestrianSpeedDetector(pixels_per_meter, self.ped_csv)
-                print("Speed Detector initialized.")
-                
+                self.speed_detector.pipeline = self  # Add pipeline reference
+                print("Speed Detector initialized with pipeline reference.")
+            
             if self.processors['PCA']:
-                self.crossing_analyzer = PedestrianCrossingAnalyzer(self.ped_csv)
+                self.crossing_analyzer = PedestrianCrossingAnalyzer(self.ped_csv, self.num_lanes)
                 print("Crossing Analyzer initialization complete.")
                 
             if self.processors['CARPSM']:
@@ -125,6 +198,223 @@ class PedestrianPipeline:
         except Exception as e:
             print(f"Error during initialization: {str(e)}")
             raise
+
+    def setup_database_tables(self):
+        """Setup necessary database tables"""
+        try:
+            # Create tables if they don't exist
+            tables = [
+                """CREATE TABLE IF NOT EXISTS location_dimension (
+                    location_key INT PRIMARY KEY,
+                    metro_city_province VARCHAR(255),
+                    district VARCHAR(255),
+                    neighborhood VARCHAR(255),
+                    spot VARCHAR(255)
+                )""",
+                
+                """CREATE TABLE IF NOT EXISTS road_character_dimension (
+                    road_key INT PRIMARY KEY,
+                    road_type VARCHAR(255),
+                    road_feature VARCHAR(255)
+                )""",
+                
+                """CREATE TABLE IF NOT EXISTS time_dimension (
+                    time_key INT PRIMARY KEY,
+                    week VARCHAR(50),
+                    day VARCHAR(50),
+                    day_night VARCHAR(10),
+                    hour VARCHAR(50),
+                    full_timestamp DATETIME
+                )""",
+                
+                """CREATE TABLE IF NOT EXISTS scene_dimension (
+                    scene_key INT PRIMARY KEY,
+                    object_type VARCHAR(50),
+                    event_type VARCHAR(50)
+                )""",
+                
+                """CREATE TABLE IF NOT EXISTS behavior_feature (
+                    behavior_id INT PRIMARY KEY,
+                    behavior_feature VARCHAR(255)
+                )""",
+                
+                """CREATE TABLE IF NOT EXISTS fact_table (
+                    time_key INT,
+                    location_key INT,
+                    road_key INT,
+                    scene_key INT,
+                    scene_ratio FLOAT,
+                    video_code VARCHAR(255),
+                    PRIMARY KEY (time_key, location_key, road_key, scene_key),
+                    FOREIGN KEY (time_key) REFERENCES time_dimension(time_key),
+                    FOREIGN KEY (location_key) REFERENCES location_dimension(location_key),
+                    FOREIGN KEY (road_key) REFERENCES road_character_dimension(road_key),
+                    FOREIGN KEY (scene_key) REFERENCES scene_dimension(scene_key)
+                )""",
+                
+                """CREATE TABLE IF NOT EXISTS scene_behavior_feature (
+                    scene_key INT,
+                    object_type VARCHAR(50),
+                    behavior_id INT,
+                    behavior_value FLOAT,
+                    PRIMARY KEY (scene_key, behavior_id),
+                    FOREIGN KEY (scene_key) REFERENCES scene_dimension(scene_key),
+                    FOREIGN KEY (behavior_id) REFERENCES behavior_feature(behavior_id)
+                )"""
+            ]
+            
+            for table in tables:
+                self.db_cursor.execute(table)
+            
+            # Insert behavior features if they don't exist
+            behaviors = [
+                (1, 'Reference_Speed'),
+                (2, 'Speed_5m'),
+                (3, 'Speed_10m'),
+                (4, 'Speed_15m'),
+                (5, 'Average_Speed'),
+                (6, 'Pedestrian_Speed'),
+                (7, 'Vehicle_Class'),
+                (8, 'Acceleration')  # New behavior ID for acceleration/deceleration
+            ]
+            
+            for behavior in behaviors:
+                self.db_cursor.execute(
+                    "INSERT IGNORE INTO behavior_feature (behavior_id, behavior_feature) VALUES (%s, %s)",
+                    behavior
+                )
+            
+            # Insert sample location and road data
+            self.db_cursor.execute(
+                """INSERT IGNORE INTO location_dimension 
+                   (location_key, metro_city_province, district, neighborhood, spot)
+                   VALUES (1, 'Sample City', 'Sample District', 'Sample Area', 'Sample Spot')"""
+            )
+            
+            self.db_cursor.execute(
+                """INSERT IGNORE INTO road_character_dimension
+                   (road_key, road_type, road_feature)
+                   VALUES (1, 'Sample Road Type', 'Sample Feature')"""
+            )
+            
+            self.db_connection.commit()
+            print("Database tables setup complete")
+            
+        except Error as e:
+            print(f"Error setting up database tables: {e}")
+            raise
+
+    def insert_track_data(self, track_id: int, object_type: str, speeds: dict = None, class_id: int = None):
+        """Insert track data into database"""
+        if not self.db_connection or not self.db_cursor:
+            print("Warning: Database connection not available. Cannot insert track data.")
+            return
+            
+        try:
+            # Ensure all values are proper Python types
+            track_id = int(track_id)
+            current_time = read_time_from_xml()  # Use XML time instead of system time
+            
+            # Print debug information
+            print(f"Inserting track data for {object_type} ID {track_id}")
+            if speeds:
+                print(f"Speeds to insert: {speeds}")
+            
+            # Insert time dimension
+            self.db_cursor.execute(
+                """INSERT IGNORE INTO time_dimension 
+                   (time_key, week, day, day_night, hour, full_timestamp)
+                   VALUES (%s, %s, %s, %s, %s, %s)""",
+                (
+                    track_id,
+                    f"Week{current_time.strftime('%V')}",
+                    current_time.strftime('%A'),
+                    'Day' if 6 <= current_time.hour <= 18 else 'Night',
+                    current_time.strftime('%Y-%m-%d %H:00:00'),
+                    current_time.strftime('%Y-%m-%d %H:%M:%S')
+                )
+            )
+            print("Time dimension inserted")
+            
+            # Insert scene dimension
+            self.db_cursor.execute(
+                """INSERT IGNORE INTO scene_dimension
+                   (scene_key, object_type, event_type)
+                   VALUES (%s, %s, %s)""",
+                (track_id, str(object_type), 'movement')
+            )
+            print("Scene dimension inserted")
+            
+            # Insert fact table
+            self.db_cursor.execute(
+                """INSERT IGNORE INTO fact_table
+                   (time_key, location_key, road_key, scene_key, scene_ratio, video_code)
+                   VALUES (%s, %s, %s, %s, %s, %s)""",
+                (track_id, 1, 1, track_id, 1.0, f"video_{self.video_id}_{track_id}")
+            )
+            print("Fact table inserted")
+            
+            # Insert behavior features for speeds
+            if speeds:
+                for behavior_id, speed in speeds.items():
+                    # Ensure proper types
+                    behavior_id = int(behavior_id)
+                    speed = float(speed)
+                    
+                    # Skip if speed is too low
+                    if speed < 3.0:
+                        print(f"Skipping speed {speed:.2f} km/h for behavior_id {behavior_id} (below threshold)")
+                        continue
+                    
+                    print(f"Inserting speed {speed:.2f} km/h for behavior_id {behavior_id}")
+                    
+                    try:
+                        # Insert or update the speed
+                        self.db_cursor.execute(
+                            """INSERT INTO scene_behavior_feature
+                               (scene_key, object_type, behavior_id, behavior_value)
+                               VALUES (%s, %s, %s, %s)
+                               ON DUPLICATE KEY UPDATE behavior_value = VALUES(behavior_value)""",
+                            (track_id, str(object_type), behavior_id, speed)
+                        )
+                        print(f"Speed {speed:.2f} km/h inserted for behavior_id {behavior_id}")
+                    except Error as e:
+                        print(f"Error inserting speed: {e}")
+                        print(f"Debug - track_id: {track_id} ({type(track_id)}), "
+                              f"behavior_id: {behavior_id} ({type(behavior_id)}), "
+                              f"speed: {speed} ({type(speed)})")
+                        raise
+            
+            # Insert vehicle class if provided
+            if class_id is not None:
+                class_id = int(class_id)
+                print(f"Inserting vehicle class {class_id} for track {track_id}")
+                self.db_cursor.execute(
+                    """INSERT INTO scene_behavior_feature
+                       (scene_key, object_type, behavior_id, behavior_value)
+                       VALUES (%s, %s, %s, %s)
+                       ON DUPLICATE KEY UPDATE behavior_value = VALUES(behavior_value)""",
+                    (track_id, str(object_type), 7, float(class_id))
+                )
+                print("Vehicle class inserted")
+            
+            # Commit the transaction
+            self.db_connection.commit()
+            print(f"Successfully committed track data for {object_type} ID {track_id}")
+            
+        except Error as e:
+            print(f"Error inserting track data: {e}")
+            self.db_connection.rollback()
+            # Print more detailed error information
+            import traceback
+            traceback.print_exc()
+
+    def cleanup(self):
+        """Cleanup database connection"""
+        if hasattr(self, 'db_cursor') and self.db_cursor:
+            self.db_cursor.close()
+        if hasattr(self, 'db_connection') and self.db_connection:
+            self.db_connection.close()
 
     def select_roi(self, frame):
         """Allow user to select region of interest for bird's eye view"""
@@ -212,6 +502,9 @@ class PedestrianPipeline:
             width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
             height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
             self.fps = int(cap.get(cv2.CAP_PROP_FPS))
+            if self.fps == 0:  # If FPS cannot be determined, use default
+                self.fps = 25  # Default FPS
+            print(f"Video FPS: {self.fps}")
             
             # Update byte track frame rate
             self.byte_track = sv.ByteTrack(
@@ -253,6 +546,11 @@ class PedestrianPipeline:
             if self.processors['Ultralytics']:
                 self.ultralytics_processor.select_reference_points(first_frame)
             
+            # Select vehicle counting region if VCOMP is enabled
+            if self.processors['VCOMP']:
+                print("\nSelect region for vehicle counting:")
+                self.vehicle_analyzer.select_count_region(first_frame)
+            
             # Reset video capture
             cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
             
@@ -286,7 +584,7 @@ class PedestrianPipeline:
                 if not ret:
                     break
                 
-                current_time = datetime.now().strftime('%H:%M:%S')
+                current_time = read_time_from_xml(frame_count=frame_count, fps=self.fps).strftime('%H:%M:%S')
                 frame_time = float(frame_count) / float(self.fps)
                 
                 try:
@@ -299,7 +597,7 @@ class PedestrianPipeline:
                     # Process frames through external components with tracked objects
                     ped_frame = frame.copy()
                     if self.processors['PCA']:
-                        ped_frame = self.crossing_analyzer.process_frame(ped_frame, ped_tracks, frame_time, vehicle_tracks)
+                        ped_frame = self.crossing_analyzer.process_frame(ped_frame, ped_tracks, frame_time, vehicle_tracks, current_time)
                     if self.processors['PS']:
                         ped_frame = self.speed_detector.process_frame(ped_frame, ped_tracks, frame_time)
                     
@@ -309,7 +607,7 @@ class PedestrianPipeline:
                     
                     vcomp_frame = frame.copy()
                     if self.processors['VCOMP']:
-                        vcomp_frame = self.vehicle_analyzer.process_frame(vcomp_frame, vehicle_tracks, self.vehicle_classes)
+                        vcomp_frame = self.vehicle_analyzer.process_frame(vcomp_frame, vehicle_tracks, self.vehicle_classes, frame_time)
                     
                     # Process bird's eye view only if enabled
                     if self.processors['BirdEye']:
@@ -397,7 +695,8 @@ class PedestrianPipeline:
                 print(f"Ultralytics Processor output saved to: {ultra_output_path}")
             
             print(f"CSV files saved to logs directory:")
-            print(f"  - Pedestrian analysis: {os.path.abspath(self.ped_csv)}")
+            if self.processors['PS']:
+                print(f"  - Pedestrian analysis: {os.path.abspath(self.ped_csv)}")
             if self.processors['CARPSM']:
                 print(f"  - Vehicle analysis: {os.path.abspath(self.vehicle_csv)}")
             if self.processors['VCOMP']:
@@ -567,14 +866,52 @@ class PedestrianPipeline:
                                 ccw(points_list[i-1], points_list[i], p1) != ccw(points_list[i-1], points_list[i], p2)):
                                 
                                 # Calculate speed at crossing point
-                                start_y = points_list[0][1] / self.pixels_per_meter  # Convert to meters
-                                end_y = points_list[-1][1] / self.pixels_per_meter   # Convert to meters
-                                distance = abs(end_y - start_y)  # Distance in meters
-                                time = len(points_list) / self.fps     # Time in seconds
-                                speed = distance / time * 3.6          # Convert to km/h
+                                start_y = float(points_list[0][1] / self.pixels_per_meter)  # Convert to meters
+                                end_y = float(points_list[-1][1] / self.pixels_per_meter)   # Convert to meters
+                                distance = float(abs(end_y - start_y))  # Distance in meters
+                                time = float(len(points_list) / self.fps)     # Time in seconds
+                                speed = float(distance / time * 3.6)          # Convert to km/h
                                 
                                 # Store the speed for this vehicle at this line
                                 self.vehicle_speeds[track_id][line_key] = speed
+                                
+                                # Log speed to SQL database with appropriate behavior_id
+                                behavior_ids = {
+                                    'main': 1,  # Reference_Speed
+                                    '5m': 2,    # Speed_5m
+                                    '10m': 3,   # Speed_10m
+                                    '15m': 4    # Speed_15m
+                                }
+                                
+                                if line_key in behavior_ids:
+                                    # Print debug information
+                                    print(f"Inserting speed for vehicle {track_id} at {line_key}: {speed:.2f} km/h")
+                                    
+                                    # Convert track_id to int if it's numpy type
+                                    track_id_int = int(float(track_id))
+                                    
+                                    # Create speeds dictionary with Python native float
+                                    speeds_dict = {behavior_ids[line_key]: float(speed)}
+                                    
+                                    # Get class_id and ensure it's a Python native type
+                                    class_id = self.vehicle_classes.get(track_id)
+                                    if class_id is not None:
+                                        class_id = int(class_id)
+                                    
+                                    # Insert the speed into the database
+                                    try:
+                                        self.insert_track_data(
+                                            track_id=track_id_int,
+                                            object_type='vehicle',
+                                            speeds=speeds_dict,
+                                            class_id=class_id
+                                        )
+                                        print(f"Successfully inserted speed {speed:.2f} km/h for vehicle {track_id_int}")
+                                    except Exception as e:
+                                        print(f"Error inserting speed data: {e}")
+                                        print(f"Debug info - track_id type: {type(track_id_int)}, "
+                                              f"speed type: {type(list(speeds_dict.values())[0])}, "
+                                              f"class_id type: {type(class_id) if class_id is not None else None}")
             
             # Display all calculated speeds for this vehicle
             if track_id in self.vehicle_speeds:
@@ -601,13 +938,31 @@ class PedestrianPipeline:
                         if ref_speed > main_speed:
                             label = "DECELERATION"
                             label_color = (0, 0, 255)  # Red
+                            accel_value = 0  # 0 for deceleration
                         else:
                             label = "ACCELERATION"
                             label_color = (0, 255, 0)  # Green
+                            accel_value = 1  # 1 for acceleration
                             
                         cv2.putText(birds_eye_frame, label,
                                    (int(transformed_point[0]) + 5, int(transformed_point[1]) + y_offset),
                                    cv2.FONT_HERSHEY_SIMPLEX, 1.5, label_color, 3)
+                        
+                        # Store acceleration/deceleration in the database
+                        try:
+                            # Convert track_id to int if it's numpy type
+                            track_id_int = int(float(track_id))
+                            
+                            # Insert acceleration/deceleration data
+                            self.insert_track_data(
+                                track_id=track_id_int,
+                                object_type='vehicle',
+                                speeds={8: float(accel_value)},  # Behavior ID 8 for acceleration
+                                class_id=self.vehicle_classes.get(track_id)
+                            )
+                            print(f"Inserted acceleration data for vehicle {track_id_int}: {label}")
+                        except Exception as e:
+                            print(f"Error inserting acceleration data: {e}")
         
         # Add title and scale information with much larger text
         cv2.putText(birds_eye_frame, "Bird's Eye View", (10, 80),
@@ -666,6 +1021,10 @@ class PedestrianPipeline:
         vehicle_detections = []
         
         for det in results.boxes.data.tolist():
+            # Ensure we have at least 6 elements (x1, y1, x2, y2, conf, cls)
+            if len(det) < 6:
+                continue
+                
             x1, y1, x2, y2, conf, cls = det
             if conf > self.conf_threshold:
                 if int(cls) == 3:  # Pedestrian class
@@ -682,6 +1041,9 @@ class PedestrianPipeline:
             
             # Process each track for consistent IDs
             for track in ped_tracks:
+                if len(track) < 5:  # Ensure track has enough elements
+                    continue
+                    
                 tracker_id = int(track[4])
                 
                 # Get or assign global ID
@@ -709,6 +1071,9 @@ class PedestrianPipeline:
             
             # Process each vehicle track
             for track in vehicle_tracks:
+                if len(track) < 5:  # Ensure track has enough elements
+                    continue
+                    
                 tracker_id = int(track[4])
                 bbox = track[:4]
                 
@@ -749,9 +1114,14 @@ def main():
     try:
         # Configuration
         model_path = "best(3).pt"
-        video_path = "real2.mp4"
+        video_path = "export6.mp4" 
         pixels_per_meter = 100
 
+        # Verify XML time is being used
+        xml_time = read_time_from_xml()
+        print(f"XML time verification: {xml_time}")
+        print(f"System time for comparison: {datetime.now()}")
+        
         # Processor selection
         print("\nSelect which processors to enable (y/n for each):")
         processors = {
