@@ -87,7 +87,7 @@ class PedestrianSpeedDetector:
                     
                     # Store in database
                     speed_data = {
-                        6: avg_speed  # Behavior ID 6 is for pedestrian speed
+                        12: avg_speed  # Behavior ID 12 is for pedestrian_speed
                     }
                     self.pipeline.insert_track_data(track_id, 'pedestrian', speed_data)
                     

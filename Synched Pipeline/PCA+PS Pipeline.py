@@ -15,6 +15,8 @@ from collections import defaultdict, deque
 import mysql.connector
 from mysql.connector import Error
 import xml.etree.ElementTree as ET
+import pandas as pd
+import time
 
 # Add DB configuration
 DB_CONFIG = {
@@ -48,13 +50,18 @@ def read_time_from_xml(xml_file_path='D:\\fydp final\\ijp\\C0043M01.XML', frame_
         # Parse the ISO 8601 format timestamp
         # Remove timezone info as it's not needed for our purposes
         timestamp_str = timestamp_str.split('+')[0]
-        base_time = datetime.strptime(timestamp_str, '%Y-%m-%dT%H:%M:%S')
+        try:
+            base_time = datetime.strptime(timestamp_str, '%Y-%m-%dT%H:%M:%S')
+        except ValueError:
+            print(f"Error parsing timestamp {timestamp_str}. Using system time instead.")
+            return datetime.now()
         
         # Calculate time offset based on frame count and FPS
         seconds_offset = frame_count / fps
         time_delta = timedelta(seconds=seconds_offset)
         xml_time = base_time + time_delta
         
+        print(f"XML Time: {xml_time}")  # Debug print
         return xml_time
         
     except Exception as e:
@@ -156,15 +163,15 @@ class PedestrianPipeline:
             
             # Setup CSV paths
             timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-            os.makedirs('logs', exist_ok=True)
+            os.makedirs('Synched Pipeline/logs', exist_ok=True)
             
             # Create and store CSV paths with unique names
-            self.ped_csv = f'logs/pedestrian_analysis_{timestamp}.csv'
-            self.vehicle_csv = f'logs/vehicle_analysis_{timestamp}.csv'
-            self.vcomp_csv = f'logs/vehicle_counts_{timestamp}.csv'
-            self.ultra_csv = f'logs/ultralytics_analysis_{timestamp}.csv'
+            self.ped_csv = f'Synched Pipeline/logs/pedestrian_analysis_{timestamp}.csv'
+            self.vehicle_csv = f'Synched Pipeline/logs/vehicle_analysis_{timestamp}.csv'
+            self.vcomp_csv = f'Synched Pipeline/logs/vehicle_counts_{timestamp}.csv'
+            self.ultra_csv = f'Synched Pipeline/logs/ultralytics_analysis_{timestamp}.csv'
             
-            print(f"CSV files will be saved to logs directory with timestamp: {timestamp}")
+            print(f"CSV files will be saved to Synched Pipeline/logs directory with timestamp: {timestamp}")
             
             # Initialize only enabled processors
             if self.processors['PS']:
@@ -186,6 +193,7 @@ class PedestrianPipeline:
             if self.processors['VCOMP']:
                 print(f"Vehicle counts CSV: {self.vcomp_csv}")
                 self.vehicle_analyzer = VehicleAnalyzer(self.vcomp_csv)
+                self.vehicle_analyzer.set_database_connection(self.db_connection, self.db_cursor)
                 print("VehicleAnalyzer initialization complete.")
                 
             if self.processors['Ultralytics']:
@@ -205,7 +213,7 @@ class PedestrianPipeline:
             # Create tables if they don't exist
             tables = [
                 """CREATE TABLE IF NOT EXISTS location_dimension (
-                    location_key INT PRIMARY KEY,
+                    location_key INTEGER PRIMARY KEY,
                     metro_city_province VARCHAR(255),
                     district VARCHAR(255),
                     neighborhood VARCHAR(255),
@@ -213,36 +221,37 @@ class PedestrianPipeline:
                 )""",
                 
                 """CREATE TABLE IF NOT EXISTS road_character_dimension (
-                    road_key INT PRIMARY KEY,
+                    road_key INTEGER PRIMARY KEY,
                     road_type VARCHAR(255),
                     road_feature VARCHAR(255)
                 )""",
                 
                 """CREATE TABLE IF NOT EXISTS time_dimension (
-                    time_key INT PRIMARY KEY,
-                    week VARCHAR(50),
-                    day VARCHAR(50),
+                    time_key INTEGER PRIMARY KEY,
+                    week VARCHAR(20),
+                    day VARCHAR(20),
                     day_night VARCHAR(10),
-                    hour VARCHAR(50),
-                    full_timestamp DATETIME
+                    date DATE,
+                    hour INTEGER,
+                    minute INTEGER
                 )""",
                 
                 """CREATE TABLE IF NOT EXISTS scene_dimension (
-                    scene_key INT PRIMARY KEY,
+                    scene_key INTEGER PRIMARY KEY,
                     object_type VARCHAR(50),
                     event_type VARCHAR(50)
                 )""",
                 
                 """CREATE TABLE IF NOT EXISTS behavior_feature (
-                    behavior_id INT PRIMARY KEY,
+                    behavior_id INTEGER PRIMARY KEY,
                     behavior_feature VARCHAR(255)
                 )""",
                 
                 """CREATE TABLE IF NOT EXISTS fact_table (
-                    time_key INT,
-                    location_key INT,
-                    road_key INT,
-                    scene_key INT,
+                    time_key INTEGER,
+                    location_key INTEGER,
+                    road_key INTEGER,
+                    scene_key INTEGER,
                     scene_ratio FLOAT,
                     video_code VARCHAR(255),
                     PRIMARY KEY (time_key, location_key, road_key, scene_key),
@@ -253,58 +262,101 @@ class PedestrianPipeline:
                 )""",
                 
                 """CREATE TABLE IF NOT EXISTS scene_behavior_feature (
-                    scene_key INT,
+                    scene_key INTEGER,
                     object_type VARCHAR(50),
-                    behavior_id INT,
+                    behavior_id INTEGER,
                     behavior_value FLOAT,
                     PRIMARY KEY (scene_key, behavior_id),
                     FOREIGN KEY (scene_key) REFERENCES scene_dimension(scene_key),
                     FOREIGN KEY (behavior_id) REFERENCES behavior_feature(behavior_id)
+                )""",
+                
+                """CREATE TABLE IF NOT EXISTS vehicle_traffic (
+                    time_key INTEGER PRIMARY KEY,
+                    pedestrian_count INTEGER DEFAULT 0,
+                    car_count INTEGER DEFAULT 0,
+                    bus_count INTEGER DEFAULT 0,
+                    truck_count INTEGER DEFAULT 0,
+                    FOREIGN KEY (time_key) REFERENCES time_dimension(time_key)
                 )"""
             ]
             
             for table in tables:
-                self.db_cursor.execute(table)
+                try:
+                    self.db_cursor.execute(table)
+                    print(f"Successfully created/verified table")
+                except Error as e:
+                    print(f"Error creating table: {e}")
+                    raise
             
             # Insert behavior features if they don't exist
             behaviors = [
-                (1, 'Reference_Speed'),
-                (2, 'Speed_5m'),
-                (3, 'Speed_10m'),
-                (4, 'Speed_15m'),
-                (5, 'Average_Speed'),
-                (6, 'Pedestrian_Speed'),
-                (7, 'Vehicle_Class'),
-                (8, 'Acceleration')  # New behavior ID for acceleration/deceleration
+                # Vehicle behaviors (IDs 1-6)
+                (1, 'vehicle_acceleration'),
+                (2, 'vehicle_speed_5m'),
+                (3, 'vehicle_speed_10m'),
+                (4, 'vehicle_speed_15m'),
+                (5, 'vehicle_avg_speed'),
+                (6, 'vehicle_class'),
+                
+                # Pedestrian behaviors (IDs 11-15)
+                (11, 'pedestrian_direction'),
+                (12, 'pedestrian_speed'),
+                (13, 'pedestrian_vehicle_type'),
+                (14, 'pedestrian_psm'),  # PSM/Time difference combined into one behavior
+                (15, 'pedestrian_parking')
             ]
             
-            for behavior in behaviors:
-                self.db_cursor.execute(
-                    "INSERT IGNORE INTO behavior_feature (behavior_id, behavior_feature) VALUES (%s, %s)",
-                    behavior
-                )
+            for behavior_id, behavior_feature in behaviors:
+                try:
+                    self.db_cursor.execute(
+                        """INSERT INTO behavior_feature (behavior_id, behavior_feature) 
+                           VALUES (%s, %s) 
+                           ON DUPLICATE KEY UPDATE behavior_feature = VALUES(behavior_feature)""",
+                        (behavior_id, behavior_feature)
+                    )
+                except Error as e:
+                    print(f"Error inserting behavior feature: {e}")
+                    raise
             
             # Insert sample location and road data
-            self.db_cursor.execute(
-                """INSERT IGNORE INTO location_dimension 
-                   (location_key, metro_city_province, district, neighborhood, spot)
-                   VALUES (1, 'Sample City', 'Sample District', 'Sample Area', 'Sample Spot')"""
-            )
+            try:
+                self.db_cursor.execute(
+                    """INSERT INTO location_dimension 
+                       (location_key, metro_city_province, district, neighborhood, spot)
+                       VALUES (%s, %s, %s, %s, %s)
+                       ON DUPLICATE KEY UPDATE 
+                       metro_city_province = VALUES(metro_city_province),
+                       district = VALUES(district),
+                       neighborhood = VALUES(neighborhood),
+                       spot = VALUES(spot)""",
+                    (1, 'Sample City', 'Sample District', 'Sample Area', 'Sample Spot')
+                )
+                
+                self.db_cursor.execute(
+                    """INSERT INTO road_character_dimension
+                       (road_key, road_type, road_feature)
+                       VALUES (%s, %s, %s)
+                       ON DUPLICATE KEY UPDATE 
+                       road_type = VALUES(road_type),
+                       road_feature = VALUES(road_feature)""",
+                    (1, 'Sample Road Type', 'Sample Feature')
+                )
+            except Error as e:
+                print(f"Error inserting sample data: {e}")
+                raise
             
-            self.db_cursor.execute(
-                """INSERT IGNORE INTO road_character_dimension
-                   (road_key, road_type, road_feature)
-                   VALUES (1, 'Sample Road Type', 'Sample Feature')"""
-            )
-            
+            # Commit all changes
             self.db_connection.commit()
             print("Database tables setup complete")
             
         except Error as e:
             print(f"Error setting up database tables: {e}")
+            self.db_connection.rollback()
             raise
 
-    def insert_track_data(self, track_id: int, object_type: str, speeds: dict = None, class_id: int = None):
+    def insert_track_data(self, track_id: int, object_type: str, speeds: dict = None, class_id: int = None, 
+                         vehicle_type: str = None, time_difference: float = None):
         """Insert track data into database"""
         if not self.db_connection or not self.db_cursor:
             print("Warning: Database connection not available. Cannot insert track data.")
@@ -319,19 +371,24 @@ class PedestrianPipeline:
             print(f"Inserting track data for {object_type} ID {track_id}")
             if speeds:
                 print(f"Speeds to insert: {speeds}")
+            if vehicle_type:
+                print(f"Vehicle type to insert: {vehicle_type}")
+            if time_difference:
+                print(f"PSM/Time difference to insert: {time_difference}")
             
             # Insert time dimension
             self.db_cursor.execute(
                 """INSERT IGNORE INTO time_dimension 
-                   (time_key, week, day, day_night, hour, full_timestamp)
-                   VALUES (%s, %s, %s, %s, %s, %s)""",
+                   (time_key, week, day, day_night, date, hour, minute)
+                   VALUES (%s, %s, %s, %s, %s, %s, %s)""",
                 (
                     track_id,
                     f"Week{current_time.strftime('%V')}",
                     current_time.strftime('%A'),
                     'Day' if 6 <= current_time.hour <= 18 else 'Night',
-                    current_time.strftime('%Y-%m-%d %H:00:00'),
-                    current_time.strftime('%Y-%m-%d %H:%M:%S')
+                    current_time.date(),
+                    current_time.hour,
+                    current_time.minute
                 )
             )
             print("Time dimension inserted")
@@ -394,9 +451,34 @@ class PedestrianPipeline:
                        (scene_key, object_type, behavior_id, behavior_value)
                        VALUES (%s, %s, %s, %s)
                        ON DUPLICATE KEY UPDATE behavior_value = VALUES(behavior_value)""",
-                    (track_id, str(object_type), 7, float(class_id))
+                    (track_id, str(object_type), 6, float(class_id))  # behavior_id 6 for vehicle_class
                 )
                 print("Vehicle class inserted")
+            
+            # Insert vehicle type if provided (for pedestrians)
+            if vehicle_type is not None and object_type == 'pedestrian':
+                print(f"Inserting vehicle type {vehicle_type} for pedestrian {track_id}")
+                vehicle_type_id = self.get_vehicle_type_id(vehicle_type)
+                self.db_cursor.execute(
+                    """INSERT INTO scene_behavior_feature
+                       (scene_key, object_type, behavior_id, behavior_value)
+                       VALUES (%s, %s, %s, %s)
+                       ON DUPLICATE KEY UPDATE behavior_value = VALUES(behavior_value)""",
+                    (track_id, str(object_type), 13, float(vehicle_type_id))  # behavior_id 13 for pedestrian_vehicle_type
+                )
+                print(f"Vehicle type {vehicle_type} (ID: {vehicle_type_id}) inserted for pedestrian")
+            
+            # Insert PSM/time difference if provided (for pedestrians)
+            if time_difference is not None and object_type == 'pedestrian':
+                print(f"Inserting PSM/time difference {time_difference} seconds for pedestrian {track_id}")
+                self.db_cursor.execute(
+                    """INSERT INTO scene_behavior_feature
+                       (scene_key, object_type, behavior_id, behavior_value)
+                       VALUES (%s, %s, %s, %s)
+                       ON DUPLICATE KEY UPDATE behavior_value = VALUES(behavior_value)""",
+                    (track_id, str(object_type), 14, float(time_difference))  # behavior_id 14 for PSM/time difference
+                )
+                print("PSM/time difference inserted")
             
             # Commit the transaction
             self.db_connection.commit()
@@ -488,23 +570,41 @@ class PedestrianPipeline:
 
     def process_video(self, video_path: str):
         """Process video file and coordinate external processing"""
+        # Normalize path and check existence
+        video_path = os.path.abspath(video_path)
         if not os.path.exists(video_path):
-            print(f"Error: Video file not found: {video_path}")
-            return
+            raise FileNotFoundError(f"Video file not found: {video_path}")
+        
+        print(f"\nProcessing video: {video_path}")
+        print(f"Video directory: {os.path.dirname(video_path)}")
+        
+        start_time = time.time()
+        last_update_time = start_time
+        update_interval = 5  # seconds
         
         try:
-            print(f"Processing video: {video_path}")
+            # Initialize video capture
             cap = cv2.VideoCapture(video_path)
             if not cap.isOpened():
                 raise ValueError(f"Could not open video file: {video_path}")
             
-            # Get video properties and setup
+            # Get video properties with validation
             width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
             height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
             self.fps = int(cap.get(cv2.CAP_PROP_FPS))
-            if self.fps == 0:  # If FPS cannot be determined, use default
+            total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            
+            if width <= 0 or height <= 0:
+                raise ValueError("Invalid video dimensions")
+            if self.fps <= 0:
                 self.fps = 25  # Default FPS
-            print(f"Video FPS: {self.fps}")
+                print("Warning: Could not determine FPS, using default value of 25")
+            
+            print(f"\nVideo properties:")
+            print(f"- Dimensions: {width}x{height}")
+            print(f"- FPS: {self.fps}")
+            print(f"- Total frames: {total_frames}")
+            print(f"- Duration: {total_frames/self.fps:.2f} seconds")
             
             # Update byte track frame rate
             self.byte_track = sv.ByteTrack(
@@ -529,21 +629,27 @@ class PedestrianPipeline:
             
             # Get first frame for setup
             ret, first_frame = cap.read()
-            if not ret:
+            if not ret or first_frame is None:
                 raise ValueError("Could not read first frame")
+            
+            print("\nSetting up processing components...")
             
             # Setup bird's eye view
             target_width, target_height = self.setup_birds_eye_view(first_frame)
+            print("Bird's eye view setup complete")
             
             # Select lanes and target y-coordinate for car detection if CARPSM is enabled
             if self.processors['PCA']:
+                print("\nSelect points for pedestrian crossing analysis:")
                 self.crossing_analyzer.select_points(first_frame)
                 if self.processors['CARPSM']:
+                    print("\nSelect target y-coordinate for car detection:")
                     self.car_detector.lanes = self.crossing_analyzer.lanes
                     self.car_detector.select_target_y(first_frame)
             
             # Select reference points for Ultralytics processor if enabled
             if self.processors['Ultralytics']:
+                print("\nSelect reference points for Ultralytics processor:")
                 self.ultralytics_processor.select_reference_points(first_frame)
             
             # Select vehicle counting region if VCOMP is enabled
@@ -551,131 +657,196 @@ class PedestrianPipeline:
                 print("\nSelect region for vehicle counting:")
                 self.vehicle_analyzer.select_count_region(first_frame)
             
-            # Reset video capture
+            # Reset video capture to start
             cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
             
-            # Create output directory and video writers
+            # Create output directory
             os.makedirs('output', exist_ok=True)
+            print("\nInitializing video writers...")
             
-            # Initialize video writers only for enabled processors
-            ped_output_path = os.path.join('output', f"processed_{os.path.basename(video_path)}")
-            ped_out = cv2.VideoWriter(ped_output_path, cv2.VideoWriter_fourcc(*'mp4v'), self.fps, (width, height))
+            # Initialize video writers for enabled processors
+            writers = {}
+            if any(self.processors.values()):  # Only create writers if any processor is enabled
+                writers['ped'] = cv2.VideoWriter(
+                    os.path.join('output', f"processed_{os.path.basename(video_path)}"),
+                    cv2.VideoWriter_fourcc(*'mp4v'), self.fps, (width, height)
+                )
+                
+                if self.processors['CARPSM']:
+                    writers['car'] = cv2.VideoWriter(
+                        os.path.join('output', f"carpsm_{os.path.basename(video_path)}"),
+                        cv2.VideoWriter_fourcc(*'mp4v'), self.fps, (width, height)
+                    )
+                
+                if self.processors['VCOMP']:
+                    writers['vcomp'] = cv2.VideoWriter(
+                        os.path.join('output', f"vcomp_{os.path.basename(video_path)}"),
+                        cv2.VideoWriter_fourcc(*'mp4v'), self.fps, (width, height)
+                    )
+                
+                if self.processors['BirdEye']:
+                    writers['birds_eye'] = cv2.VideoWriter(
+                        os.path.join('output', f"birds_eye_{os.path.basename(video_path)}"),
+                        cv2.VideoWriter_fourcc(*'mp4v'), self.fps, (target_width, target_height)
+                    )
+                
+                if self.processors['Ultralytics']:
+                    writers['ultra'] = cv2.VideoWriter(
+                        os.path.join('output', f"ultralytics_{os.path.basename(video_path)}"),
+                        cv2.VideoWriter_fourcc(*'mp4v'), self.fps, (width, height)
+                    )
             
-            if self.processors['CARPSM']:
-                car_output_path = os.path.join('output', f"carpsm_{os.path.basename(video_path)}")
-                car_out = cv2.VideoWriter(car_output_path, cv2.VideoWriter_fourcc(*'mp4v'), self.fps, (width, height))
-            
-            if self.processors['VCOMP']:
-                vcomp_output_path = os.path.join('output', f"vcomp_{os.path.basename(video_path)}")
-                vcomp_out = cv2.VideoWriter(vcomp_output_path, cv2.VideoWriter_fourcc(*'mp4v'), self.fps, (width, height))
-            
-            if self.processors['BirdEye']:
-                birds_eye_path = os.path.join('output', f"birds_eye_{os.path.basename(video_path)}")
-                birds_eye_out = cv2.VideoWriter(birds_eye_path, cv2.VideoWriter_fourcc(*'mp4v'), self.fps, (target_width, target_height))
-            
-            if self.processors['Ultralytics']:
-                ultra_output_path = os.path.join('output', f"ultralytics_{os.path.basename(video_path)}")
-                ultra_out = cv2.VideoWriter(ultra_output_path, cv2.VideoWriter_fourcc(*'mp4v'), self.fps, (width, height))
+            print("Video writers initialized")
+            print("\nStarting video processing...")
             
             frame_count = 0
-            
             while True:
-                ret, frame = cap.read()
-                if not ret:
-                    break
-                
-                current_time = read_time_from_xml(frame_count=frame_count, fps=self.fps).strftime('%H:%M:%S')
-                frame_time = float(frame_count) / float(self.fps)
-                
                 try:
-                    # Get detections from YOLO model with NMS
-                    results = self.model(frame, conf=self.conf_threshold, iou=0.5)[0]
-                    
-                    # Process detections and get tracked objects
-                    ped_tracks, vehicle_tracks = self.process_detections(results, frame)
-                    
-                    # Process frames through external components with tracked objects
-                    ped_frame = frame.copy()
-                    if self.processors['PCA']:
-                        ped_frame = self.crossing_analyzer.process_frame(ped_frame, ped_tracks, frame_time, vehicle_tracks, current_time)
-                    if self.processors['PS']:
-                        ped_frame = self.speed_detector.process_frame(ped_frame, ped_tracks, frame_time)
-                    
-                    car_frame = frame.copy()
-                    if self.processors['CARPSM']:
-                        car_frame = self.car_detector.process_frame(car_frame, vehicle_tracks, current_time)
-                    
-                    vcomp_frame = frame.copy()
-                    if self.processors['VCOMP']:
-                        vcomp_frame = self.vehicle_analyzer.process_frame(vcomp_frame, vehicle_tracks, self.vehicle_classes, frame_time)
-                    
-                    # Process bird's eye view only if enabled
-                    if self.processors['BirdEye']:
-                        birds_eye_frame, visible_ids = self.process_birds_eye_view(frame, vehicle_tracks)
-                    else:
-                        birds_eye_frame = np.zeros((target_height, target_width, 3), dtype=np.uint8)
-                        visible_ids = set()
-                    
-                    # Process frame with Ultralytics processor
-                    ultra_frame = frame.copy()
-                    if self.processors['Ultralytics']:
-                        ultra_frame = self.ultralytics_processor.process_frame(ultra_frame, vehicle_tracks, visible_ids)
-                    
-                    # Add timestamp and frame info to frames
-                    for frame_to_write in [ped_frame] + \
-                                        ([car_frame] if self.processors['CARPSM'] else []) + \
-                                        ([vcomp_frame] if self.processors['VCOMP'] else []) + \
-                                        ([ultra_frame] if self.processors['Ultralytics'] else []):
-                        cv2.putText(frame_to_write, f"Time: {current_time}", (10, 30),
-                                  cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
-                        cv2.putText(frame_to_write, f"Frame: {frame_count} | FPS: {self.fps:.1f}", 
-                                  (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
-                    
-                    # Write frames only for enabled processors
-                    ped_out.write(ped_frame)
-                    if self.processors['CARPSM']:
-                        car_out.write(car_frame)
-                    if self.processors['VCOMP']:
-                        vcomp_out.write(vcomp_frame)
-                    if self.processors['BirdEye']:
-                        birds_eye_out.write(birds_eye_frame)
-                    if self.processors['Ultralytics']:
-                        ultra_out.write(ultra_frame)
-                    
-                    # Display frames only for enabled processors
-                    cv2.imshow('Traffic Analysis', ped_frame)
-                    if self.processors['CARPSM']:
-                        cv2.imshow('Car PSM', car_frame)
-                    if self.processors['VCOMP']:
-                        cv2.imshow('Vehicle Composition', vcomp_frame)
-                    if self.processors['BirdEye']:
-                        cv2.imshow('Bird\'s Eye View', birds_eye_frame)
-                    if self.processors['Ultralytics']:
-                        cv2.imshow('Ultralytics Processor', ultra_frame)
-                    
-                    if cv2.waitKey(1) & 0xFF == ord('q'):
-                        print("\nProcessing interrupted by user")
+                    ret, frame = cap.read()
+                    if not ret:
                         break
                     
-                except Exception as e:
-                    print(f"Error processing frame {frame_count}: {str(e)}")
-                    # Write original frame if processing fails
-                    ped_out.write(frame)
-                    if self.processors['CARPSM']:
-                        car_out.write(frame)
-                    if self.processors['VCOMP']:
-                        vcomp_out.write(frame)
-                    if self.processors['BirdEye']:
-                        birds_eye_out.write(np.zeros((target_height, target_width, 3), dtype=np.uint8))
-                    if self.processors['Ultralytics']:
-                        ultra_out.write(frame)
+                    current_time = read_time_from_xml(frame_count=frame_count, fps=self.fps).strftime('%H:%M:%S')
+                    frame_time = float(frame_count) / float(self.fps)
+                    
+                    try:
+                        # Get detections from YOLO model with NMS
+                        results = self.model(frame, conf=self.conf_threshold, iou=0.5)[0]
+                        
+                        # Process detections and get tracked objects
+                        ped_tracks, vehicle_tracks = self.process_detections(results, frame)
+                        
+                        # Process frames through enabled components
+                        processed_frames = {}
+                        
+                        try:
+                            # Main pedestrian frame
+                            ped_frame = frame.copy()
+                            if self.processors['PCA']:
+                                ped_frame = self.crossing_analyzer.process_frame(
+                                    ped_frame, ped_tracks, frame_time, vehicle_tracks, current_time)
+                            if self.processors['PS']:
+                                ped_frame = self.speed_detector.process_frame(
+                                    ped_frame, ped_tracks, frame_time)
+                            processed_frames['ped'] = ped_frame
+                        except Exception as e:
+                            print(f"Error processing pedestrian frame: {e}")
+                            processed_frames['ped'] = frame.copy()
+                        
+                        try:
+                            # Car PSM frame
+                            if self.processors['CARPSM']:
+                                car_frame = frame.copy()
+                                processed_frames['car'] = self.car_detector.process_frame(
+                                    car_frame, vehicle_tracks, current_time)
+                        except Exception as e:
+                            print(f"Error processing car frame: {e}")
+                            if self.processors['CARPSM']:
+                                processed_frames['car'] = frame.copy()
+                        
+                        try:
+                            # Vehicle composition frame
+                            if self.processors['VCOMP']:
+                                vcomp_frame = frame.copy()
+                                processed_frames['vcomp'] = self.vehicle_analyzer.process_frame(
+                                    vcomp_frame, vehicle_tracks, self.vehicle_classes, frame_time)
+                        except Exception as e:
+                            print(f"Error processing vehicle composition frame: {e}")
+                            if self.processors['VCOMP']:
+                                processed_frames['vcomp'] = frame.copy()
+                        
+                        try:
+                            # Bird's eye view frame
+                            if self.processors['BirdEye']:
+                                birds_eye_frame, visible_ids = self.process_birds_eye_view(frame, vehicle_tracks)
+                                processed_frames['birds_eye'] = birds_eye_frame
+                            else:
+                                visible_ids = set()
+                        except Exception as e:
+                            print(f"Error processing bird's eye view frame: {e}")
+                            visible_ids = set()
+                        
+                        try:
+                            # Ultralytics frame
+                            if self.processors['Ultralytics']:
+                                ultra_frame = frame.copy()
+                                processed_frames['ultra'] = self.ultralytics_processor.process_frame(
+                                    ultra_frame, vehicle_tracks, visible_ids)
+                        except Exception as e:
+                            print(f"Error processing ultralytics frame: {e}")
+                            if self.processors['Ultralytics']:
+                                processed_frames['ultra'] = frame.copy()
+                        
+                        # Add timestamp and frame info to all frames
+                        for key, processed_frame in processed_frames.items():
+                            if key != 'birds_eye':  # Don't add to bird's eye view
+                                cv2.putText(processed_frame, f"Time: {current_time}", (10, 30),
+                                          cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+                                cv2.putText(processed_frame, f"Frame: {frame_count} | FPS: {self.fps:.1f}", 
+                                          (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+                        
+                        # Write frames to video files
+                        for key, processed_frame in processed_frames.items():
+                            if key in writers:
+                                writers[key].write(processed_frame)
+                        
+                        # Display frames
+                        for key, processed_frame in processed_frames.items():
+                            window_name = {
+                                'ped': 'Traffic Analysis',
+                                'car': 'Car PSM',
+                                'vcomp': 'Vehicle Composition',
+                                'birds_eye': "Bird's Eye View",
+                                'ultra': 'Ultralytics Processor'
+                            }.get(key, key)
+                            cv2.imshow(window_name, processed_frame)
+                        
+                        if cv2.waitKey(1) & 0xFF == ord('q'):
+                            print("\nProcessing interrupted by user")
+                            break
+                        
+                    except Exception as e:
+                        print(f"Error processing frame {frame_count}:")
+                        print(f"Error details: {str(e)}")
+                        import traceback
+                        traceback.print_exc()
+                        # Write original frame if processing fails
+                        for writer in writers.values():
+                            writer.write(frame)
+                    
+                    # Update progress
+                    frame_count += 1
+                    current_time = time.time()
+                    if current_time - last_update_time >= update_interval:
+                        progress = (frame_count / total_frames) * 100
+                        elapsed_time = current_time - start_time
+                        fps = frame_count / elapsed_time
+                        eta = (total_frames - frame_count) / fps
+                        
+                        print(f"\nProgress update:")
+                        print(f"- Processed frames: {frame_count}/{total_frames} ({progress:.1f}%)")
+                        print(f"- Average FPS: {fps:.1f}")
+                        print(f"- Elapsed time: {elapsed_time:.1f}s")
+                        print(f"- Estimated time remaining: {eta:.1f}s")
+                        
+                        last_update_time = current_time
                 
-                frame_count += 1
-                if frame_count % 30 == 0:
-                    print(f"Processed {frame_count} frames")
+                except Exception as e:
+                    print(f"Critical error processing frame {frame_count}: {str(e)}")
+                    import traceback
+                    traceback.print_exc()
+                    break
+            
+            # Final statistics
+            total_time = time.time() - start_time
+            average_fps = frame_count / total_time
+            print(f"\nProcessing complete!")
+            print(f"- Total frames processed: {frame_count}")
+            print(f"- Total time: {total_time:.1f}s")
+            print(f"- Average FPS: {average_fps:.1f}")
             
             # Save final results
-            print("Saving final results...")
+            print("\nSaving final results...")
             if self.processors['VCOMP']:
                 self.vehicle_analyzer.save_results_to_csv()
                 self.vehicle_analyzer.print_statistics()
@@ -683,45 +854,56 @@ class PedestrianPipeline:
                 self.ultralytics_processor.save_results_to_csv()
                 self.ultralytics_processor.print_statistics()
             
-            print(f"\nProcessing complete!")
-            print(f"Pedestrian output saved to: {ped_output_path}")
-            if self.processors['CARPSM']:
-                print(f"Car PSM output saved to: {car_output_path}")
-            if self.processors['VCOMP']:
-                print(f"Vehicle Composition output saved to: {vcomp_output_path}")
-            if self.processors['BirdEye']:
-                print(f"Bird's Eye View output saved to: {birds_eye_path}")
-            if self.processors['Ultralytics']:
-                print(f"Ultralytics Processor output saved to: {ultra_output_path}")
+            # Print output paths
+            print("\nOutput files:")
+            for key, writer in writers.items():
+                output_path = os.path.join('output', f"{key}_{os.path.basename(video_path)}")
+                print(f"- {key}: {os.path.abspath(output_path)}")
             
-            print(f"CSV files saved to logs directory:")
+            print("\nCSV files:")
             if self.processors['PS']:
-                print(f"  - Pedestrian analysis: {os.path.abspath(self.ped_csv)}")
+                print(f"- Pedestrian analysis: {os.path.abspath(self.ped_csv)}")
             if self.processors['CARPSM']:
-                print(f"  - Vehicle analysis: {os.path.abspath(self.vehicle_csv)}")
+                print(f"- Vehicle analysis: {os.path.abspath(self.vehicle_csv)}")
             if self.processors['VCOMP']:
-                print(f"  - Vehicle counts: {os.path.abspath(self.vcomp_csv)}")
+                print(f"- Vehicle counts: {os.path.abspath(self.vcomp_csv)}")
             if self.processors['Ultralytics']:
-                print(f"  - Ultralytics analysis: {os.path.abspath(self.ultra_csv)}")
+                print(f"- Ultralytics analysis: {os.path.abspath(self.ultra_csv)}")
+            
+            # Process PSM results
+            print("\nProcessing PSM results...")
+            psm_results_path = os.path.join('results', 'pedestrian_vehicle_analysis.csv')
+            if os.path.exists(psm_results_path):
+                self.process_psm_results(psm_results_path)
+            else:
+                print(f"PSM results file not found at: {psm_results_path}")
             
         except Exception as e:
             print(f"Error during video processing: {str(e)}")
-            raise
-            
+            import traceback
+            traceback.print_exc()
+        
         finally:
-            if 'cap' in locals():
-                cap.release()
-            if 'ped_out' in locals():
-                ped_out.release()
-            if 'car_out' in locals() and self.processors['CARPSM']:
-                car_out.release()
-            if 'vcomp_out' in locals() and self.processors['VCOMP']:
-                vcomp_out.release()
-            if 'birds_eye_out' in locals() and self.processors['BirdEye']:
-                birds_eye_out.release()
-            if 'ultra_out' in locals() and self.processors['Ultralytics']:
-                ultra_out.release()
-            cv2.destroyAllWindows()
+            # Cleanup resources
+            try:
+                if 'cap' in locals():
+                    cap.release()
+                for writer in writers.values():
+                    writer.release()
+                cv2.destroyAllWindows()
+                
+                # Close database connection
+                if hasattr(self, 'db_connection') and self.db_connection:
+                    if hasattr(self, 'db_cursor') and self.db_cursor:
+                        self.db_cursor.close()
+                    self.db_connection.close()
+                
+                print("\nAll resources cleaned up successfully")
+                
+            except Exception as e:
+                print(f"Error during cleanup: {e}")
+                import traceback
+                traceback.print_exc()
 
     def process_birds_eye_view(self, frame, vehicle_tracks):
         """Process frame for bird's eye view"""
@@ -957,7 +1139,7 @@ class PedestrianPipeline:
                             self.insert_track_data(
                                 track_id=track_id_int,
                                 object_type='vehicle',
-                                speeds={8: float(accel_value)},  # Behavior ID 8 for acceleration
+                                speeds={1: float(accel_value)},  # behavior_id 1 for vehicle_acceleration
                                 class_id=self.vehicle_classes.get(track_id)
                             )
                             print(f"Inserted acceleration data for vehicle {track_id_int}: {label}")
@@ -1110,42 +1292,120 @@ class PedestrianPipeline:
             
         return ped_tracks, vehicle_tracks
 
+    def process_psm_results(self, psm_results_file):
+        """Process PSM results and update database with time difference and vehicle type based on pedestrian IDs"""
+        try:
+            # Read PSM results
+            psm_df = pd.read_csv(psm_results_file)
+            
+            # Process each row
+            for _, row in psm_df.iterrows():
+                pedestrian_id = row['Pedestrian_ID']
+                time_diff = row['Time_Difference']
+                vehicle_type = row['Vehicle_Type']
+                
+                # Convert time_diff to float, handling '<1' case
+                time_diff_value = 0.5 if time_diff == '<1' else float(time_diff)
+                
+                # Insert pedestrian data with both time difference and vehicle type
+                self.insert_track_data(
+                    track_id=pedestrian_id,
+                    object_type='pedestrian',
+                    time_difference=time_diff_value,
+                    vehicle_type=vehicle_type  # Associate vehicle type with pedestrian ID
+                )
+                
+                print(f"Processed PSM data for pedestrian {pedestrian_id} with vehicle type {vehicle_type}")
+            
+            print("Successfully processed PSM results and updated database")
+            
+        except Exception as e:
+            print(f"Error processing PSM results: {e}")
+            import traceback
+            traceback.print_exc()
+
+    def get_vehicle_type_id(self, vehicle_type):
+        """Convert vehicle type string to numeric ID"""
+        vehicle_type_map = {
+            'Biker': 1,
+            'Motorbike': 2,
+            'Car': 3,
+            'Taxi': 4,
+            'Bus': 5,
+            'Truck': 6,
+            'Unknown': 0
+        }
+        return vehicle_type_map.get(vehicle_type, 0)
+
 def main():
     try:
         # Configuration
         model_path = "best(3).pt"
-        video_path = "export6.mp4" 
         pixels_per_meter = 100
+
+        # Get video path from user
+        while True:
+            video_path = input("\nEnter the path to the video file (or press Enter for default 'real4.mp4'): ").strip()
+            if not video_path:
+                video_path = "real4.mp4"
+            if os.path.exists(video_path):
+                print(f"Using video file: {video_path}")
+                break
+            print(f"Error: Video file not found at: {video_path}")
 
         # Verify XML time is being used
         xml_time = read_time_from_xml()
         print(f"XML time verification: {xml_time}")
         print(f"System time for comparison: {datetime.now()}")
         
-        # Processor selection
-        print("\nSelect which processors to enable (y/n for each):")
+        # Processor selection with default values
         processors = {
-            'PS': input("Enable Pedestrian Speed Detector (PS)? ").lower().startswith('y'),
-            'PCA': input("Enable Pedestrian Crossing Analyzer (PCA)? ").lower().startswith('y'),
-            'Ultralytics': input("Enable Ultralytics Processor? ").lower().startswith('y'),
-            'VCOMP': input("Enable Vehicle Composition Analyzer (VCOMP)? ").lower().startswith('y'),
-            'CARPSM': input("Enable Car PSM Detector (CARPSM)? ").lower().startswith('y'),
-            'BirdEye': input("Enable Bird's Eye View? ").lower().startswith('y')
+            'PS': True,      # Pedestrian Speed Detector
+            'PCA': True,     # Pedestrian Crossing Analyzer
+            'CARPSM': True,  # Car PSM Detector
+            'VCOMP': True,   # Vehicle Composition Analyzer
+            'Ultralytics': True,  # Ultralytics Processor
+            'BirdEye': True  # Bird's Eye View
         }
-        
-        print("\nEnabled processors:")
+
+        print("\nCurrent processor settings (all enabled by default):")
         for name, enabled in processors.items():
             print(f"{name}: {'Enabled' if enabled else 'Disabled'}")
+
+        change = input("\nWould you like to change any processor settings? (y/n): ").lower().strip()
+        if change.startswith('y'):
+            print("\nEnter 'y' to enable or 'n' to disable each processor:")
+            for name in processors.keys():
+                while True:
+                    response = input(f"Enable {name}? (y/n): ").lower().strip()
+                    if response in ['y', 'n']:
+                        processors[name] = (response == 'y')
+                        break
+                    print("Please enter 'y' or 'n'")
+
+            print("\nUpdated processor settings:")
+            for name, enabled in processors.items():
+                print(f"{name}: {'Enabled' if enabled else 'Disabled'}")
         
-        if not os.path.exists(video_path):
-            raise FileNotFoundError(f"Video file not found at: {video_path}")
-        
+        # Initialize pipeline
+        print("\nInitializing pipeline...")
         pipeline = PedestrianPipeline(model_path, pixels_per_meter, processors)
+        
+        # Process video
+        print(f"\nProcessing video: {video_path}")
         pipeline.process_video(video_path)
         
+    except KeyboardInterrupt:
+        print("\nProcessing interrupted by user")
     except Exception as e:
         print(f"Error in main: {str(e)}")
-        return
+        import traceback
+        traceback.print_exc()
+    finally:
+        # Cleanup
+        if 'pipeline' in locals():
+            pipeline.cleanup()
+        cv2.destroyAllWindows()
 
 if __name__ == "__main__":
     main()
