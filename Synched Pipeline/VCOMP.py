@@ -94,6 +94,8 @@ class VehicleAnalyzer:
                 # Test the connection
                 self.db_cursor.execute("SELECT 1")
                 print("Database connection successfully set")
+                # Setup tables after connection is established
+                self.setup_database_tables()
                 return True
             else:
                 print("Warning: Invalid database connection provided")
@@ -104,6 +106,74 @@ class VehicleAnalyzer:
             self.db_connection = None
             self.db_cursor = None
             return False
+
+    def setup_database_tables(self):
+        """Setup necessary database tables"""
+        try:
+            print("\n=== Setting up database tables ===")
+            
+            # Clear any unread results
+            while self.db_cursor.nextset():
+                pass
+            
+            # First, check if hour column in time_dimension has an index
+            print("Checking time_dimension table structure...")
+            self.db_cursor.execute("""
+                SELECT COUNT(*) 
+                FROM information_schema.STATISTICS 
+                WHERE table_schema = DATABASE()
+                AND table_name = 'time_dimension' 
+                AND column_name = 'hour'
+            """)
+            has_index = self.db_cursor.fetchone()[0] > 0
+
+            if not has_index:
+                print("Adding index on hour column in time_dimension...")
+                self.db_cursor.execute("ALTER TABLE time_dimension ADD INDEX idx_hour (hour)")
+                print("✓ Added index on hour column")
+            else:
+                print("✓ Index on hour column already exists")
+
+            # Drop vehicle_traffic table
+            print("\nAttempting to drop vehicle_traffic table...")
+            self.db_cursor.execute("DROP TABLE IF EXISTS vehicle_traffic")
+            self.db_cursor.fetchall()  # Clear result
+            print("✓ Successfully dropped vehicle_traffic table")
+
+            # Create vehicle_traffic table
+            print("\nCreating vehicle_traffic table...")
+            create_table_sql = """
+                CREATE TABLE vehicle_traffic (
+                    hour INT NOT NULL,
+                    minute_interval INT NOT NULL,
+                    pedestrian_count INT DEFAULT 0,
+                    car_count INT DEFAULT 0,
+                    bus_count INT DEFAULT 0,
+                    truck_count INT DEFAULT 0,
+                    PRIMARY KEY (hour),
+                    FOREIGN KEY (hour) REFERENCES time_dimension(hour)
+                )
+            """
+            print(f"SQL Query:\n{create_table_sql}")
+            
+            self.db_cursor.execute(create_table_sql)
+            while self.db_cursor.nextset():  # Clear any additional result sets
+                pass
+            print("✓ Successfully created vehicle_traffic table")
+            
+            # Commit the changes
+            self.db_connection.commit()
+            print("✓ Changes committed successfully")
+            print("=== Database setup complete ===\n")
+            
+        except Error as e:
+            print(f"\n❌ Error setting up vehicle_traffic table: {e}")
+            print(f"Error code: {e.errno}")
+            print(f"SQL State: {e.sqlstate}")
+            if self.db_connection:
+                self.db_connection.rollback()
+                print("Changes rolled back")
+            raise
 
     def parse_xml_metadata(self):
         """Parse XML file for metadata"""
@@ -148,6 +218,9 @@ class VehicleAnalyzer:
             # Calculate timestamp from frame time using XML time
             timestamp = self.get_timestamp_from_frame(int(frame_time * 25))  # Assuming 25 fps
             
+            # Format time key as YYYYMMDDHHMM
+            time_key = timestamp.strftime('%Y%m%d%H%M')
+            
             # Convert vehicle class to proper type
             vehicle_class = str(vehicle_class)
             track_id = int(track_id)
@@ -168,7 +241,7 @@ class VehicleAnalyzer:
                    (time_key, week, day, day_night, date, hour, minute)
                    VALUES (%s, %s, %s, %s, %s, %s, %s)""",
                 (
-                    track_id,
+                    time_key,  # Using formatted time key instead of track_id
                     f"Week{timestamp.strftime('%V')}",
                     timestamp.strftime('%A'),
                     'Day' if 6 <= timestamp.hour <= 18 else 'Night',
@@ -189,11 +262,26 @@ class VehicleAnalyzer:
                    bus_count = bus_count + VALUES(bus_count),
                    truck_count = truck_count + VALUES(truck_count)""",
                 (
-                    track_id,
+                    time_key,  # Using formatted time key instead of track_id
                     vehicle_counts['biker'] + vehicle_counts['motobike'],  # Pedestrian count (bikers + motobikes)
                     vehicle_counts['sedan'] + vehicle_counts['taxi'],      # Car count (sedans + taxis)
                     vehicle_counts['bus'],                                 # Bus count
                     vehicle_counts['truck']                               # Truck count
+                )
+            )
+            
+            # Insert fact table with same time key
+            self.db_cursor.execute(
+                """INSERT IGNORE INTO fact_table 
+                   (time_key, location_key, road_key, scene_key, scene_ratio, video_code)
+                   VALUES (%s, %s, %s, %s, %s, %s)""",
+                (
+                    time_key,  # Using formatted time key instead of track_id
+                    1,
+                    1,
+                    track_id,  # Still using track_id for scene_key
+                    1.0,
+                    f"video_{self.video_id}_{track_id}"
                 )
             )
             
@@ -283,23 +371,23 @@ class VehicleAnalyzer:
             
             # Check if a 10-minute interval has passed
             current_interval = int((frame_time // 60) // 10)  # Convert to 10-minute intervals
-            if current_interval > self.current_interval and current_interval <= 5:  # Max 6 intervals per hour
-                # Save the previous interval's counts
+            
+            # Save data if interval changed or significant time passed
+            if (current_interval > self.current_interval) or (frame_time % 300 == 0):  # Save every 5 minutes
                 if sum(len(ids) for ids in self.current_interval_counts.values()) > 0:
-                    self.interval_counts.append(self.current_interval_counts)
-                    print(f"Saved interval {self.current_interval} with counts: {self.current_interval_counts}")
-                # Reset for new interval
-                self.current_interval_counts = {k: set() for k in self.vehicle_counts.keys()}
-                self.current_interval = current_interval
+                    print(f"\nSaving data for interval {self.current_interval}")
+                    print(f"Current counts: {self.current_interval_counts}")
+                    # Create a copy of current counts before saving
+                    interval_data = {k: set(v) for k, v in self.current_interval_counts.items()}
+                    self.interval_counts.append(interval_data)
+                    self.save_partial_data()
+                
+                if current_interval > self.current_interval:
+                    # Reset for new interval only if interval changed
+                    self.current_interval_counts = {k: set() for k in self.vehicle_counts.keys()}
+                    self.current_interval = current_interval
             
-            # Draw counting region if defined
-            if self.count_region is not None:
-                cv2.polylines(processed_frame, [self.count_region], True, (0, 255, 0), 2)
-                cv2.putText(processed_frame, "Counting Region", 
-                           tuple(self.count_region[0]), 
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-            
-            # Process tracked objects
+            # Process tracked objects and update counts
             for track in tracks:
                 track_id = int(track[4])
                 bbox = track[:4]
@@ -321,37 +409,27 @@ class VehicleAnalyzer:
                         self.current_interval_counts[vehicle_class].add(track_id)
                         print(f"Added vehicle {track_id} of class {vehicle_class} to interval {self.current_interval}")
                     
-                    # Draw bounding box
+                    # Draw bounding box and label
                     color = self.get_color_for_class(vehicle_class)
-                    cv2.rectangle(
-                        processed_frame,
-                        (int(bbox[0]), int(bbox[1])),
-                        (int(bbox[2]), int(bbox[3])),
-                        color,
-                        2
-                    )
+                    cv2.rectangle(processed_frame, (int(bbox[0]), int(bbox[1])),
+                                (int(bbox[2]), int(bbox[3])), color, 2)
                     
-                    # Add label
                     label = f"{vehicle_class} ID:{track_id}"
-                    cv2.putText(
-                        processed_frame,
-                        label,
-                        (int(bbox[0]), int(bbox[1]) - 10),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        0.5,
-                        color,
-                        2
-                    )
+                    cv2.putText(processed_frame, label, (int(bbox[0]), int(bbox[1]) - 10),
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
                     
                     frame_counts[vehicle_class] += 1
             
-            # Add count overlay with time period
+            # Draw counting region if defined
+            if self.count_region is not None:
+                cv2.polylines(processed_frame, [self.count_region], True, (0, 255, 0), 2)
+                cv2.putText(processed_frame, "Counting Region", 
+                           tuple(self.count_region[0]), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+            
+            # Add count overlay
             processed_frame = self.add_count_overlay(processed_frame, frame_time)
             
-            # Save data every 10 minutes
-            if frame_time % 600 == 0:  # Every 10 minutes (600 seconds)
-                self.save_partial_data()
-                
             return processed_frame
             
         except Exception as e:
@@ -463,31 +541,130 @@ class VehicleAnalyzer:
 
     def cleanup_handler(self):
         """Handle cleanup when the program exits"""
-        if not self.data_saved:
-            print("\nSaving partial vehicle count data...")
-            self.save_partial_data()
+        try:
+            print("\n=== Starting cleanup process ===")
+            print("Video stopped. Saving final vehicle count data...")
+            
+            # Force save all remaining data
+            if sum(len(ids) for ids in self.current_interval_counts.values()) > 0:
+                # Save current interval data
+                current_interval_start = self.start_time + timedelta(minutes=self.current_interval * 10)
+                current_minute_interval = self.current_interval * 10
+                
+                # Calculate final counts
+                vehicle_type_counts = {
+                    'pedestrian': len(self.current_interval_counts.get('biker', set())) + 
+                                 len(self.current_interval_counts.get('motobike', set())),
+                    'car': len(self.current_interval_counts.get('sedan', set())) + 
+                           len(self.current_interval_counts.get('taxi', set())),
+                    'bus': len(self.current_interval_counts.get('bus', set())),
+                    'truck': len(self.current_interval_counts.get('truck', set()))
+                }
+                
+                print(f"\nFinal vehicle counts at time {current_interval_start}:")
+                print(f"Current interval: {self.current_interval}")
+                print(f"Minute interval: {current_minute_interval}")
+                print("Vehicle counts:", vehicle_type_counts)
+                
+                if not self.ensure_db_connection():
+                    print("\nAttempting final database reconnection...")
+                    try:
+                        self.db_connection = mysql.connector.connect(**DB_CONFIG)
+                        self.db_cursor = self.db_connection.cursor()
+                        print("✓ Successfully reconnected for final save")
+                    except Error as e:
+                        print(f"❌ Failed to reconnect for final save: {e}")
+                        return
+                
+                try:
+                    print("\nStarting final database transaction...")
+                    # Start final transaction
+                    self.db_cursor.execute("START TRANSACTION")
+                    
+                    # Insert final vehicle traffic data
+                    insert_sql = """
+                        INSERT INTO vehicle_traffic
+                        (hour, minute_interval, pedestrian_count, car_count, bus_count, truck_count)
+                        VALUES (%s, %s, %s, %s, %s, %s)
+                        ON DUPLICATE KEY UPDATE
+                        minute_interval = %s,
+                        pedestrian_count = pedestrian_count + VALUES(pedestrian_count),
+                        car_count = car_count + VALUES(car_count),
+                        bus_count = bus_count + VALUES(bus_count),
+                        truck_count = truck_count + VALUES(truck_count)
+                    """
+                    
+                    values = (
+                        current_interval_start.hour,
+                        current_minute_interval,
+                        vehicle_type_counts['pedestrian'],
+                        vehicle_type_counts['car'],
+                        vehicle_type_counts['bus'],
+                        vehicle_type_counts['truck'],
+                        current_minute_interval
+                    )
+                    
+                    print("\nExecuting SQL insert:")
+                    print(f"SQL: {insert_sql}")
+                    print(f"Values: {values}")
+                    
+                    self.db_cursor.execute(insert_sql, values)
+                    
+                    # Commit final transaction
+                    self.db_connection.commit()
+                    print("✓ Final vehicle count data saved successfully")
+                    
+                except Error as e:
+                    print(f"\n❌ Error saving final data: {e}")
+                    print(f"Error code: {e.errno}")
+                    print(f"SQL State: {e.sqlstate}")
+                    if self.db_connection:
+                        self.db_connection.rollback()
+                        print("Changes rolled back")
+                finally:
+                    print("\nPerforming final cleanup...")
+                    # Save to CSV as backup
+                    self.save_results_to_csv()
+                    print("✓ CSV backup saved")
+                    
+                    # Close database connections
+                    if self.db_cursor:
+                        self.db_cursor.close()
+                        print("✓ Database cursor closed")
+                    if self.db_connection:
+                        self.db_connection.close()
+            
             self.data_saved = True
+            print("\n=== Cleanup complete ===")
+            
+        except Exception as e:
+            print(f"\n❌ Error during cleanup: {e}")
+            import traceback
+            print("Traceback:")
+            traceback.print_exc()
 
     def signal_handler(self, signum, frame):
         """Handle interrupt signals"""
-        print(f"\nReceived signal {signum}. Saving partial data before exit...")
-        self.save_partial_data()
-        self.data_saved = True
+        print(f"\nReceived signal {signum}. Performing emergency save...")
+        self.cleanup_handler()  # Use the same cleanup logic
         sys.exit(0)
 
     def save_partial_data(self):
         """Save interval-based vehicle count data to database"""
         try:
-            # Save current interval data if any exists
-            if sum(len(ids) for ids in self.current_interval_counts.values()) > 0:
-                self.interval_counts.append(self.current_interval_counts)
-                self.current_interval_counts = {k: set() for k in self.vehicle_counts.keys()}
+            print("\n=== Starting partial data save ===")
+            if not self.ensure_db_connection():
+                print("Attempting to reconnect to database...")
+                try:
+                    self.db_connection = mysql.connector.connect(**DB_CONFIG)
+                    self.db_cursor = self.db_connection.cursor()
+                    print("✓ Successfully reconnected to database")
+                except Error as e:
+                    print(f"❌ Failed to reconnect to database: {e}")
+                    return False
 
             # Start transaction
-            if not self.ensure_db_connection():
-                print("Database connection not available")
-                return False
-
+            print("\nStarting database transaction...")
             self.db_cursor.execute("START TRANSACTION")
             
             # Process each interval's data
@@ -495,9 +672,7 @@ class VehicleAnalyzer:
                 try:
                     # Calculate interval start time based on XML start time
                     interval_start = self.start_time + timedelta(minutes=interval * 10)
-                    
-                    # Format time key as YYYYMMDDHHMM
-                    time_key = interval_start.strftime('%Y%m%d%H%M')
+                    current_minute_interval = interval * 10
                     
                     # Calculate vehicle type counts for this interval
                     vehicle_type_counts = {
@@ -507,72 +682,82 @@ class VehicleAnalyzer:
                         'truck': len(counts.get('truck', set()))
                     }
 
-                    print(f"Saving data for interval {interval} at time {interval_start}")
+                    print(f"\nProcessing interval {interval}:")
+                    print(f"Time: {interval_start}")
+                    print(f"Minute interval: {current_minute_interval}")
                     print(f"Vehicle counts: {vehicle_type_counts}")
                     
-                    # Insert time dimension first
-                    self.db_cursor.execute(
-                        """INSERT IGNORE INTO time_dimension 
-                           (time_key, week, day, day_night, date, hour, minute)
-                           VALUES (%s, %s, %s, %s, %s, %s, %s)""",
-                        (
-                            time_key,
-                            f"Week{interval_start.strftime('%V')}",
-                            interval_start.strftime('%A'),
-                            'Day' if 6 <= interval_start.hour <= 18 else 'Night',
-                            interval_start.date(),
-                            interval_start.hour,
-                            interval_start.minute
-                        )
-                    )
-                    
                     # Insert vehicle traffic data
-                    self.db_cursor.execute(
-                        """INSERT INTO vehicle_traffic
-                           (time_key, pedestrian_count, car_count, bus_count, truck_count)
-                           VALUES (%s, %s, %s, %s, %s)
-                           ON DUPLICATE KEY UPDATE
-                           pedestrian_count = VALUES(pedestrian_count),
-                           car_count = VALUES(car_count),
-                           bus_count = VALUES(bus_count),
-                           truck_count = VALUES(truck_count)""",
-                        (
-                            time_key,
-                            vehicle_type_counts['pedestrian'],
-                            vehicle_type_counts['car'],
-                            vehicle_type_counts['bus'],
-                            vehicle_type_counts['truck']
-                        )
+                    insert_sql = """
+                        INSERT INTO vehicle_traffic
+                        (hour, minute_interval, pedestrian_count, car_count, bus_count, truck_count)
+                        VALUES (%s, %s, %s, %s, %s, %s)
+                        ON DUPLICATE KEY UPDATE
+                        minute_interval = %s,
+                        pedestrian_count = pedestrian_count + VALUES(pedestrian_count),
+                        car_count = car_count + VALUES(car_count),
+                        bus_count = bus_count + VALUES(bus_count),
+                        truck_count = truck_count + VALUES(truck_count)
+                    """
+                    
+                    values = (
+                        interval_start.hour,
+                        current_minute_interval,
+                        vehicle_type_counts['pedestrian'],
+                        vehicle_type_counts['car'],
+                        vehicle_type_counts['bus'],
+                        vehicle_type_counts['truck'],
+                        current_minute_interval
                     )
                     
-                    print(f"Successfully saved data for interval {interval}")
+                    print(f"\nExecuting SQL insert for interval {interval}:")
+                    print(f"SQL: {insert_sql}")
+                    print(f"Values: {values}")
                     
+                    self.db_cursor.execute(insert_sql, values)
+                    print(f"✓ Successfully saved data for interval {interval}")
+                            
                 except Error as e:
-                    print(f"Error processing interval {interval}: {e}")
+                    print(f"\n❌ Error processing interval {interval}: {e}")
+                    print(f"Error code: {e.errno}")
+                    print(f"SQL State: {e.sqlstate}")
+                    if self.db_connection:
+                        self.db_connection.rollback()
+                        print("Changes rolled back")
                     continue
             
             # Commit all changes
             self.db_connection.commit()
-            print("All interval data saved successfully")
+            print("\n✓ All interval data saved successfully")
             
-            # Clear processed intervals
+            # Clear processed intervals after successful save
             self.interval_counts = []
+            print("✓ Interval counts cleared")
             
             # Also save to CSV as backup
             self.save_results_to_csv()
+            print("✓ CSV backup saved")
+            
+            print("=== Partial data save complete ===\n")
+            return True
             
         except Error as e:
-            print(f"Database error while saving interval data: {e}")
+            print(f"\n❌ Database error while saving interval data: {e}")
+            print(f"Error code: {e.errno}")
+            print(f"SQL State: {e.sqlstate}")
             if self.db_connection:
                 self.db_connection.rollback()
+                print("Changes rolled back")
             return False
         except Exception as e:
-            print(f"Unexpected error while saving interval data: {e}")
+            print(f"\n❌ Unexpected error while saving interval data: {e}")
+            import traceback
+            print("Traceback:")
+            traceback.print_exc()
             if self.db_connection:
                 self.db_connection.rollback()
+                print("Changes rolled back")
             return False
-        
-        return True
 
     def ensure_db_connection(self):
         """Ensure database connection is active"""
