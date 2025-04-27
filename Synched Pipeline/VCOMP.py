@@ -112,54 +112,31 @@ class VehicleAnalyzer:
         try:
             print("\n=== Setting up database tables ===")
             
-            # Clear any unread results
-            while self.db_cursor.nextset():
-                pass
-            
-            # First, check if hour column in time_dimension has an index
-            print("Checking time_dimension table structure...")
-            self.db_cursor.execute("""
-                SELECT COUNT(*) 
-                FROM information_schema.STATISTICS 
-                WHERE table_schema = DATABASE()
-                AND table_name = 'time_dimension' 
-                AND column_name = 'hour'
-            """)
-            has_index = self.db_cursor.fetchone()[0] > 0
-
-            if not has_index:
-                print("Adding index on hour column in time_dimension...")
-                self.db_cursor.execute("ALTER TABLE time_dimension ADD INDEX idx_hour (hour)")
-                print("✓ Added index on hour column")
-            else:
-                print("✓ Index on hour column already exists")
-
-            # Drop vehicle_traffic table
-            print("\nAttempting to drop vehicle_traffic table...")
-            self.db_cursor.execute("DROP TABLE IF EXISTS vehicle_traffic")
-            self.db_cursor.fetchall()  # Clear result
-            print("✓ Successfully dropped vehicle_traffic table")
-
-            # Create vehicle_traffic table
-            print("\nCreating vehicle_traffic table...")
+            # Create vehicle_traffic table with hour and minute_interval as primary key
             create_table_sql = """
-                CREATE TABLE vehicle_traffic (
-                    hour INT NOT NULL,
-                    minute_interval INT NOT NULL,
-                    pedestrian_count INT DEFAULT 0,
-                    car_count INT DEFAULT 0,
-                    bus_count INT DEFAULT 0,
-                    truck_count INT DEFAULT 0,
-                    PRIMARY KEY (hour),
-                    FOREIGN KEY (hour) REFERENCES time_dimension(hour)
-                )
+            CREATE TABLE IF NOT EXISTS vehicle_traffic (
+                hour INT,
+                minute_interval INT,  -- 0-5 representing 10-minute intervals
+                pedestrian_count INT DEFAULT 0,
+                car_count INT DEFAULT 0,
+                bus_count INT DEFAULT 0,
+                truck_count INT DEFAULT 0,
+                PRIMARY KEY (hour, minute_interval)
+            );
             """
+            
             print(f"SQL Query:\n{create_table_sql}")
             
-            self.db_cursor.execute(create_table_sql)
-            while self.db_cursor.nextset():  # Clear any additional result sets
-                pass
-            print("✓ Successfully created vehicle_traffic table")
+            # Execute the query and handle multiple result sets properly
+            try:
+                self.db_cursor.execute(create_table_sql)
+                # Consume any remaining result sets
+                while self.db_cursor.nextset() is not None:
+                    pass
+                print("✓ Successfully created vehicle_traffic table")
+            except Error as e:
+                print(f"❌ Error executing CREATE TABLE: {e}")
+                raise
             
             # Commit the changes
             self.db_connection.commit()
@@ -185,10 +162,10 @@ class VehicleAnalyzer:
                 # Get creation date
                 creation_date = root.find('.//{*}CreationDate')
                 if creation_date is not None and 'value' in creation_date.attrib:
-                    self.start_time = datetime.strptime(
-                        creation_date.get('value').split('+')[0],
-                        '%Y-%m-%dT%H:%M:%S'
-                    )
+                    timestamp_str = creation_date.get('value').split('+')[0]
+                    print(f"Found XML timestamp: {timestamp_str}")
+                    self.start_time = datetime.strptime(timestamp_str, '%Y-%m-%dT%H:%M:%S')
+                    print(f"Parsed XML start time: {self.start_time}")
                 else:
                     self.start_time = datetime.now()
                     print("Warning: Using system time as XML creation date not found")
@@ -203,7 +180,9 @@ class VehicleAnalyzer:
     def get_timestamp_from_frame(self, frame_count: int, fps: float = 25.0) -> datetime:
         """Calculate timestamp from frame count using XML start time"""
         seconds_offset = frame_count / fps
-        return self.start_time + timedelta(seconds=seconds_offset)
+        timestamp = self.start_time + timedelta(seconds=seconds_offset)
+        print(f"Frame {frame_count} timestamp: {timestamp}")
+        return timestamp
 
     def insert_vehicle_data(self, track_id: int, vehicle_class: str, frame_time: float):
         """Insert vehicle traffic data into database"""
@@ -218,8 +197,13 @@ class VehicleAnalyzer:
             # Calculate timestamp from frame time using XML time
             timestamp = self.get_timestamp_from_frame(int(frame_time * 25))  # Assuming 25 fps
             
-            # Format time key as YYYYMMDDHHMM
-            time_key = timestamp.strftime('%Y%m%d%H%M')
+            # Calculate 10-minute interval (0-5)
+            minute_interval = min(timestamp.minute // 10, 5)
+            
+            print(f"\nProcessing vehicle data:")
+            print(f"XML timestamp: {timestamp}")
+            print(f"Hour: {timestamp.hour}")
+            print(f"Minute interval: {minute_interval} ({minute_interval*10:02d}-{min(minute_interval*10+9, 59):02d} minutes)")
             
             # Convert vehicle class to proper type
             vehicle_class = str(vehicle_class)
@@ -235,59 +219,36 @@ class VehicleAnalyzer:
                 'truck': 1 if vehicle_class == '6' else 0
             }
             
-            # Insert time dimension with IGNORE to handle duplicates
-            self.db_cursor.execute(
-                """INSERT IGNORE INTO time_dimension 
-                   (time_key, week, day, day_night, date, hour, minute)
-                   VALUES (%s, %s, %s, %s, %s, %s, %s)""",
-                (
-                    time_key,  # Using formatted time key instead of track_id
-                    f"Week{timestamp.strftime('%V')}",
-                    timestamp.strftime('%A'),
-                    'Day' if 6 <= timestamp.hour <= 18 else 'Night',
-                    timestamp.date(),
-                    timestamp.hour,
-                    timestamp.minute
-                )
+            # Insert vehicle traffic data using hour and minute_interval
+            insert_sql = """
+            INSERT INTO vehicle_traffic
+            (hour, minute_interval, pedestrian_count, car_count, bus_count, truck_count)
+            VALUES (%s, %s, %s, %s, %s, %s)
+            ON DUPLICATE KEY UPDATE
+            pedestrian_count = pedestrian_count + VALUES(pedestrian_count),
+            car_count = car_count + VALUES(car_count),
+            bus_count = bus_count + VALUES(bus_count),
+            truck_count = truck_count + VALUES(truck_count)
+            """
+            
+            values = (
+                timestamp.hour,
+                minute_interval,
+                vehicle_counts['biker'] + vehicle_counts['motobike'],  # Pedestrian count
+                vehicle_counts['sedan'] + vehicle_counts['taxi'],      # Car count
+                vehicle_counts['bus'],                                 # Bus count
+                vehicle_counts['truck']                               # Truck count
             )
             
-            # Insert vehicle traffic data
-            self.db_cursor.execute(
-                """INSERT INTO vehicle_traffic
-                   (time_key, pedestrian_count, car_count, bus_count, truck_count)
-                   VALUES (%s, %s, %s, %s, %s)
-                   ON DUPLICATE KEY UPDATE
-                   pedestrian_count = pedestrian_count + VALUES(pedestrian_count),
-                   car_count = car_count + VALUES(car_count),
-                   bus_count = bus_count + VALUES(bus_count),
-                   truck_count = truck_count + VALUES(truck_count)""",
-                (
-                    time_key,  # Using formatted time key instead of track_id
-                    vehicle_counts['biker'] + vehicle_counts['motobike'],  # Pedestrian count (bikers + motobikes)
-                    vehicle_counts['sedan'] + vehicle_counts['taxi'],      # Car count (sedans + taxis)
-                    vehicle_counts['bus'],                                 # Bus count
-                    vehicle_counts['truck']                               # Truck count
-                )
-            )
+            print(f"\nExecuting SQL insert:")
+            print(f"SQL: {insert_sql}")
+            print(f"Values: {values}")
             
-            # Insert fact table with same time key
-            self.db_cursor.execute(
-                """INSERT IGNORE INTO fact_table 
-                   (time_key, location_key, road_key, scene_key, scene_ratio, video_code)
-                   VALUES (%s, %s, %s, %s, %s, %s)""",
-                (
-                    time_key,  # Using formatted time key instead of track_id
-                    1,
-                    1,
-                    track_id,  # Still using track_id for scene_key
-                    1.0,
-                    f"video_{self.video_id}_{track_id}"
-                )
-            )
+            self.db_cursor.execute(insert_sql, values)
             
             # Commit transaction
             self.db_connection.commit()
-            print(f"Successfully inserted traffic data for vehicle {track_id} (class {vehicle_class})")
+            print(f"✓ Successfully inserted traffic data for vehicle {track_id} (class {vehicle_class})")
             return True
             
         except Error as e:
@@ -547,9 +508,10 @@ class VehicleAnalyzer:
             
             # Force save all remaining data
             if sum(len(ids) for ids in self.current_interval_counts.values()) > 0:
-                # Save current interval data
+                # Get current XML time
                 current_interval_start = self.start_time + timedelta(minutes=self.current_interval * 10)
-                current_minute_interval = self.current_interval * 10
+                # Calculate proper 10-minute interval (0-5)
+                minute_interval = min(current_interval_start.minute // 10, 5)
                 
                 # Calculate final counts
                 vehicle_type_counts = {
@@ -562,10 +524,11 @@ class VehicleAnalyzer:
                 }
                 
                 print(f"\nFinal vehicle counts at time {current_interval_start}:")
-                print(f"Current interval: {self.current_interval}")
-                print(f"Minute interval: {current_minute_interval}")
+                print(f"Current interval: {minute_interval}")
+                print(f"XML time: {current_interval_start.strftime('%Y-%m-%d %H:%M:%S')}")
+                print(f"10-minute interval: {minute_interval} ({minute_interval*10:02d}-{min(minute_interval*10+9, 59):02d} minutes)")
                 print("Vehicle counts:", vehicle_type_counts)
-                
+
                 if not self.ensure_db_connection():
                     print("\nAttempting final database reconnection...")
                     try:
@@ -587,7 +550,6 @@ class VehicleAnalyzer:
                         (hour, minute_interval, pedestrian_count, car_count, bus_count, truck_count)
                         VALUES (%s, %s, %s, %s, %s, %s)
                         ON DUPLICATE KEY UPDATE
-                        minute_interval = %s,
                         pedestrian_count = pedestrian_count + VALUES(pedestrian_count),
                         car_count = car_count + VALUES(car_count),
                         bus_count = bus_count + VALUES(bus_count),
@@ -596,12 +558,11 @@ class VehicleAnalyzer:
                     
                     values = (
                         current_interval_start.hour,
-                        current_minute_interval,
+                        minute_interval,
                         vehicle_type_counts['pedestrian'],
                         vehicle_type_counts['car'],
                         vehicle_type_counts['bus'],
-                        vehicle_type_counts['truck'],
-                        current_minute_interval
+                        vehicle_type_counts['truck']
                     )
                     
                     print("\nExecuting SQL insert:")
@@ -672,7 +633,8 @@ class VehicleAnalyzer:
                 try:
                     # Calculate interval start time based on XML start time
                     interval_start = self.start_time + timedelta(minutes=interval * 10)
-                    current_minute_interval = interval * 10
+                    # Calculate proper 10-minute interval (0-5)
+                    minute_interval = min(interval_start.minute // 10, 5)
                     
                     # Calculate vehicle type counts for this interval
                     vehicle_type_counts = {
@@ -683,8 +645,8 @@ class VehicleAnalyzer:
                     }
 
                     print(f"\nProcessing interval {interval}:")
-                    print(f"Time: {interval_start}")
-                    print(f"Minute interval: {current_minute_interval}")
+                    print(f"XML time: {interval_start.strftime('%Y-%m-%d %H:%M:%S')}")
+                    print(f"10-minute interval: {minute_interval} ({minute_interval*10:02d}-{min(minute_interval*10+9, 59):02d} minutes)")
                     print(f"Vehicle counts: {vehicle_type_counts}")
                     
                     # Insert vehicle traffic data
@@ -693,7 +655,6 @@ class VehicleAnalyzer:
                         (hour, minute_interval, pedestrian_count, car_count, bus_count, truck_count)
                         VALUES (%s, %s, %s, %s, %s, %s)
                         ON DUPLICATE KEY UPDATE
-                        minute_interval = %s,
                         pedestrian_count = pedestrian_count + VALUES(pedestrian_count),
                         car_count = car_count + VALUES(car_count),
                         bus_count = bus_count + VALUES(bus_count),
@@ -702,12 +663,11 @@ class VehicleAnalyzer:
                     
                     values = (
                         interval_start.hour,
-                        current_minute_interval,
+                        minute_interval,
                         vehicle_type_counts['pedestrian'],
                         vehicle_type_counts['car'],
                         vehicle_type_counts['bus'],
-                        vehicle_type_counts['truck'],
-                        current_minute_interval
+                        vehicle_type_counts['truck']
                     )
                     
                     print(f"\nExecuting SQL insert for interval {interval}:")

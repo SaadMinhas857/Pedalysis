@@ -17,6 +17,7 @@ from mysql.connector import Error
 import xml.etree.ElementTree as ET
 import pandas as pd
 import time
+from typing import Tuple, Dict
 
 # Add DB configuration
 DB_CONFIG = {
@@ -26,46 +27,42 @@ DB_CONFIG = {
     'database': 'traffic_db'
 }
 
-def read_time_from_xml(xml_file_path='D:\\fydp final\\ijp\\C0043M01.XML', frame_count=0, fps=25):
-    """Read time from XML file and adjust by frame count"""
+def read_time_from_xml(xml_path: str, frame_count: int, fps: float = 25.0) -> datetime:
+    """Read time from XML file and calculate current time based on frame count"""
     try:
-        # Check if XML file exists
-        if not os.path.exists(xml_file_path):
-            print(f"XML file not found: {xml_file_path}. Using system time instead.")
+        if os.path.exists(xml_path):
+            tree = ET.parse(xml_path)
+            root = tree.getroot()
+            
+            # Get creation date from XML
+            creation_date = root.find('.//{*}CreationDate')
+            if creation_date is not None and 'value' in creation_date.attrib:
+                timestamp_str = creation_date.get('value').split('+')[0]
+                print(f"\nFound XML timestamp: {timestamp_str}")
+                
+                # Parse base time from XML
+                base_time = datetime.strptime(timestamp_str, '%Y-%m-%dT%H:%M:%S')
+                print(f"Parsed base time: {base_time}")
+                
+                # Calculate current time based on frame count
+                print(f"Frame count: {frame_count}")
+                print(f"FPS: {fps}")
+                seconds_offset = frame_count / fps
+                print(f"Seconds offset: {seconds_offset}")
+                
+                xml_time = base_time + timedelta(seconds=seconds_offset)
+                print(f"XML time: {xml_time}")
+                return xml_time
+            else:
+                print("Warning: No CreationDate found in XML, using system time")
+                return datetime.now()
+        else:
+            print(f"Warning: XML file not found at {xml_path}, using system time")
             return datetime.now()
-        
-        # Parse XML file
-        tree = ET.parse(xml_file_path)
-        root = tree.getroot()
-        
-        # Find CreationDate element and get its value attribute
-        creation_date = root.find('.//{*}CreationDate')
-        if creation_date is None or 'value' not in creation_date.attrib:
-            print("CreationDate not found in XML. Using system time instead.")
-            return datetime.now()
-        
-        # Get the timestamp string from the value attribute
-        timestamp_str = creation_date.get('value')
-        
-        # Parse the ISO 8601 format timestamp
-        # Remove timezone info as it's not needed for our purposes
-        timestamp_str = timestamp_str.split('+')[0]
-        try:
-            base_time = datetime.strptime(timestamp_str, '%Y-%m-%dT%H:%M:%S')
-        except ValueError:
-            print(f"Error parsing timestamp {timestamp_str}. Using system time instead.")
-            return datetime.now()
-        
-        # Calculate time offset based on frame count and FPS
-        seconds_offset = frame_count / fps
-        time_delta = timedelta(seconds=seconds_offset)
-        xml_time = base_time + time_delta
-        
-        print(f"XML Time: {xml_time}")  # Debug print
-        return xml_time
-        
+            
     except Exception as e:
-        print(f"Error reading time from XML: {e}. Using system time instead.")
+        print(f"Error reading XML time: {e}")
+        print("Using system time as fallback")
         return datetime.now()
 
 class ViewTransformer:
@@ -117,6 +114,8 @@ class PedestrianPipeline:
                 self.db_cursor = self.db_connection.cursor()
                 print("Successfully connected to MySQL database")
                 self.setup_database_tables()
+                self.setup_sample_data()
+                print("Sample data setup complete")
             except Error as e:
                 print(f"Error connecting to MySQL database: {e}")
                 self.db_connection = None
@@ -212,20 +211,6 @@ class PedestrianPipeline:
         try:
             # Create tables if they don't exist
             tables = [
-                """CREATE TABLE IF NOT EXISTS location_dimension (
-                    location_key INTEGER PRIMARY KEY,
-                    metro_city_province VARCHAR(255),
-                    district VARCHAR(255),
-                    neighborhood VARCHAR(255),
-                    spot VARCHAR(255)
-                )""",
-                
-                """CREATE TABLE IF NOT EXISTS road_character_dimension (
-                    road_key INTEGER PRIMARY KEY,
-                    road_type VARCHAR(255),
-                    road_feature VARCHAR(255)
-                )""",
-                
                 """CREATE TABLE IF NOT EXISTS time_dimension (
                     time_key INTEGER PRIMARY KEY,
                     week VARCHAR(20),
@@ -237,9 +222,12 @@ class PedestrianPipeline:
                 )""",
                 
                 """CREATE TABLE IF NOT EXISTS scene_dimension (
-                    scene_key INTEGER PRIMARY KEY,
+                    scene_key INTEGER,
+                    road_key INTEGER,
                     object_type VARCHAR(50),
-                    event_type VARCHAR(50)
+                    event_type VARCHAR(50),
+                    PRIMARY KEY (scene_key, road_key),
+                    FOREIGN KEY (road_key) REFERENCES road_character_dimension(road_key)
                 )""",
                 
                 """CREATE TABLE IF NOT EXISTS behavior_feature (
@@ -255,28 +243,20 @@ class PedestrianPipeline:
                     scene_ratio FLOAT,
                     video_code VARCHAR(255),
                     PRIMARY KEY (time_key, location_key, road_key, scene_key),
+                    FOREIGN KEY (scene_key, road_key) REFERENCES scene_dimension(scene_key, road_key),
                     FOREIGN KEY (time_key) REFERENCES time_dimension(time_key),
-                    FOREIGN KEY (location_key) REFERENCES location_dimension(location_key),
-                    FOREIGN KEY (road_key) REFERENCES road_character_dimension(road_key),
-                    FOREIGN KEY (scene_key) REFERENCES scene_dimension(scene_key)
-                )""",
-                
-                """CREATE TABLE IF NOT EXISTS scene_behavior_feature (
-                    scene_key INTEGER,
-                    object_type VARCHAR(50),
-                    behavior_id INTEGER,
-                    behavior_value FLOAT,
-                    PRIMARY KEY (scene_key, behavior_id),
-                    FOREIGN KEY (scene_key) REFERENCES scene_dimension(scene_key),
-                    FOREIGN KEY (behavior_id) REFERENCES behavior_feature(behavior_id)
+                    FOREIGN KEY (location_key) REFERENCES location_dimension(location_key)
                 )""",
                 
                 """CREATE TABLE IF NOT EXISTS vehicle_traffic (
-                    time_key INTEGER PRIMARY KEY,
+                    time_key INTEGER,
+                    hour INTEGER,
+                    minute_interval INTEGER,  # 0-5 for 10-minute intervals
                     pedestrian_count INTEGER DEFAULT 0,
                     car_count INTEGER DEFAULT 0,
                     bus_count INTEGER DEFAULT 0,
                     truck_count INTEGER DEFAULT 0,
+                    PRIMARY KEY (time_key, minute_interval),
                     FOREIGN KEY (time_key) REFERENCES time_dimension(time_key)
                 )"""
             ]
@@ -288,7 +268,7 @@ class PedestrianPipeline:
                 except Error as e:
                     print(f"Error creating table: {e}")
                     raise
-            
+
             # Insert behavior features if they don't exist
             behaviors = [
                 # Vehicle behaviors (IDs 1-6)
@@ -299,11 +279,12 @@ class PedestrianPipeline:
                 (5, 'vehicle_avg_speed'),
                 (6, 'vehicle_class'),
                 
-                # Pedestrian behaviors (IDs 11-15)
+                # Pedestrian behaviors (IDs 10-15)
+                (10, 'pedestrian_parking'),
                 (11, 'pedestrian_direction'),
                 (12, 'pedestrian_speed'),
                 (13, 'pedestrian_vehicle_type'),
-                (14, 'pedestrian_psm'),  # PSM/Time difference combined into one behavior
+                (14, 'pedestrian_psm'),
                 (15, 'pedestrian_parking')
             ]
             
@@ -318,33 +299,6 @@ class PedestrianPipeline:
                 except Error as e:
                     print(f"Error inserting behavior feature: {e}")
                     raise
-            
-            # Insert sample location and road data
-            try:
-                self.db_cursor.execute(
-                    """INSERT INTO location_dimension 
-                       (location_key, metro_city_province, district, neighborhood, spot)
-                       VALUES (%s, %s, %s, %s, %s)
-                       ON DUPLICATE KEY UPDATE 
-                       metro_city_province = VALUES(metro_city_province),
-                       district = VALUES(district),
-                       neighborhood = VALUES(neighborhood),
-                       spot = VALUES(spot)""",
-                    (1, 'Sample City', 'Sample District', 'Sample Area', 'Sample Spot')
-                )
-                
-                self.db_cursor.execute(
-                    """INSERT INTO road_character_dimension
-                       (road_key, road_type, road_feature)
-                       VALUES (%s, %s, %s)
-                       ON DUPLICATE KEY UPDATE 
-                       road_type = VALUES(road_type),
-                       road_feature = VALUES(road_feature)""",
-                    (1, 'Sample Road Type', 'Sample Feature')
-                )
-            except Error as e:
-                print(f"Error inserting sample data: {e}")
-                raise
             
             # Commit all changes
             self.db_connection.commit()
@@ -365,7 +319,16 @@ class PedestrianPipeline:
         try:
             # Ensure all values are proper Python types
             track_id = int(track_id)
-            current_time = read_time_from_xml()  # Use XML time instead of system time
+            
+            # Get current frame count from video capture
+            if hasattr(self, 'cap'):
+                frame_count = int(self.cap.get(cv2.CAP_PROP_POS_FRAMES))
+            else:
+                frame_count = 0
+                
+            # Get XML time based on frame count
+            current_time = read_time_from_xml(frame_count=frame_count, fps=self.fps)
+            print(f"Using XML time for frame {frame_count}: {current_time}")
             
             # Print debug information
             print(f"Inserting track data for {object_type} ID {track_id}")
@@ -376,7 +339,7 @@ class PedestrianPipeline:
             if time_difference:
                 print(f"PSM/Time difference to insert: {time_difference}")
             
-            # Insert time dimension
+            # Insert time dimension with XML-based time
             self.db_cursor.execute(
                 """INSERT IGNORE INTO time_dimension 
                    (time_key, week, day, day_night, date, hour, minute)
@@ -391,56 +354,60 @@ class PedestrianPipeline:
                     current_time.minute
                 )
             )
-            print("Time dimension inserted")
+            print(f"Time dimension inserted with XML time: {current_time}")
             
-            # Insert scene dimension
+            # Insert scene dimension with road_key=3
             self.db_cursor.execute(
                 """INSERT IGNORE INTO scene_dimension
-                   (scene_key, object_type, event_type)
-                   VALUES (%s, %s, %s)""",
-                (track_id, str(object_type), 'movement')
+                   (scene_key, road_key, object_type, event_type)
+                   VALUES (%s, %s, %s, %s)""",
+                (track_id, 3, str(object_type), 'movement')
             )
-            print("Scene dimension inserted")
+            print("Scene dimension inserted with road_key=3")
             
-            # Insert fact table
+            # Insert fact table with location_key=3 and road_key=3
             self.db_cursor.execute(
                 """INSERT IGNORE INTO fact_table
                    (time_key, location_key, road_key, scene_key, scene_ratio, video_code)
-                   VALUES (%s, %s, %s, %s, %s, %s)""",
-                (track_id, 1, 1, track_id, 1.0, f"video_{self.video_id}_{track_id}")
+                   VALUES (%s, %s, %s, %s, %s, %s)
+                   ON DUPLICATE KEY UPDATE
+                   scene_ratio = VALUES(scene_ratio),
+                   video_code = VALUES(video_code)""",
+                (track_id, 3, 3, track_id, 1.0, f"video_{self.video_id}_frame{frame_count}_{track_id}")
             )
-            print("Fact table inserted")
+            print("Fact table inserted with location_key=3, road_key=3")
             
-            # Insert behavior features for speeds
+            # Handle speeds and direction separately
             if speeds:
-                for behavior_id, speed in speeds.items():
-                    # Ensure proper types
+                for behavior_id, value in speeds.items():
                     behavior_id = int(behavior_id)
-                    speed = float(speed)
+                    value = float(value)
                     
-                    # Skip if speed is too low
-                    if speed < 3.0:
-                        print(f"Skipping speed {speed:.2f} km/h for behavior_id {behavior_id} (below threshold)")
-                        continue
-                    
-                    print(f"Inserting speed {speed:.2f} km/h for behavior_id {behavior_id}")
-                    
-                    try:
-                        # Insert or update the speed
+                    # Direction (behavior_id 11) should not be subject to speed threshold
+                    if behavior_id == 11:
+                        print(f"Inserting direction value {value} for {object_type} {track_id}")
                         self.db_cursor.execute(
                             """INSERT INTO scene_behavior_feature
                                (scene_key, object_type, behavior_id, behavior_value)
                                VALUES (%s, %s, %s, %s)
                                ON DUPLICATE KEY UPDATE behavior_value = VALUES(behavior_value)""",
-                            (track_id, str(object_type), behavior_id, speed)
+                            (track_id, str(object_type), behavior_id, value)
                         )
-                        print(f"Speed {speed:.2f} km/h inserted for behavior_id {behavior_id}")
-                    except Error as e:
-                        print(f"Error inserting speed: {e}")
-                        print(f"Debug - track_id: {track_id} ({type(track_id)}), "
-                              f"behavior_id: {behavior_id} ({type(behavior_id)}), "
-                              f"speed: {speed} ({type(speed)})")
-                        raise
+                        print(f"Direction value {value} inserted for behavior_id {behavior_id}")
+                    # For actual speeds, apply the threshold
+                    elif value < 3.0:
+                        print(f"Skipping speed {value:.2f} km/h for behavior_id {behavior_id} (below threshold)")
+                        continue
+                    else:
+                        print(f"Inserting speed {value:.2f} km/h for behavior_id {behavior_id}")
+                        self.db_cursor.execute(
+                            """INSERT INTO scene_behavior_feature
+                               (scene_key, object_type, behavior_id, behavior_value)
+                               VALUES (%s, %s, %s, %s)
+                               ON DUPLICATE KEY UPDATE behavior_value = VALUES(behavior_value)""",
+                            (track_id, str(object_type), behavior_id, value)
+                        )
+                        print(f"Speed {value:.2f} km/h inserted for behavior_id {behavior_id}")
             
             # Insert vehicle class if provided
             if class_id is not None:
@@ -482,9 +449,9 @@ class PedestrianPipeline:
             
             # Commit the transaction
             self.db_connection.commit()
-            print(f"Successfully committed track data for {object_type} ID {track_id}")
+            print(f"Successfully committed track data for {object_type} ID {track_id} at frame {frame_count}")
             
-        except Error as e:
+        except Exception as e:
             print(f"Error inserting track data: {e}")
             self.db_connection.rollback()
             # Print more detailed error information
@@ -583,16 +550,16 @@ class PedestrianPipeline:
         update_interval = 5  # seconds
         
         try:
-            # Initialize video capture
-            cap = cv2.VideoCapture(video_path)
-            if not cap.isOpened():
+            # Initialize video capture and store as instance variable
+            self.cap = cv2.VideoCapture(video_path)
+            if not self.cap.isOpened():
                 raise ValueError(f"Could not open video file: {video_path}")
             
             # Get video properties with validation
-            width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-            height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-            self.fps = int(cap.get(cv2.CAP_PROP_FPS))
-            total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            width = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+            height = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            self.fps = int(self.cap.get(cv2.CAP_PROP_FPS))
+            total_frames = int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT))
             
             if width <= 0 or height <= 0:
                 raise ValueError("Invalid video dimensions")
@@ -628,7 +595,7 @@ class PedestrianPipeline:
             )
             
             # Get first frame for setup
-            ret, first_frame = cap.read()
+            ret, first_frame = self.cap.read()
             if not ret or first_frame is None:
                 raise ValueError("Could not read first frame")
             
@@ -658,7 +625,7 @@ class PedestrianPipeline:
                 self.vehicle_analyzer.select_count_region(first_frame)
             
             # Reset video capture to start
-            cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+            self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
             
             # Create output directory
             os.makedirs('output', exist_ok=True)
@@ -702,7 +669,7 @@ class PedestrianPipeline:
             frame_count = 0
             while True:
                 try:
-                    ret, frame = cap.read()
+                    ret, frame = self.cap.read()
                     if not ret:
                         break
                     
@@ -887,7 +854,7 @@ class PedestrianPipeline:
             # Cleanup resources
             try:
                 if 'cap' in locals():
-                    cap.release()
+                    self.cap.release()
                 for writer in writers.values():
                     writer.release()
                 cv2.destroyAllWindows()
@@ -1303,19 +1270,28 @@ class PedestrianPipeline:
                 pedestrian_id = row['Pedestrian_ID']
                 time_diff = row['Time_Difference']
                 vehicle_type = row['Vehicle_Type']
+                direction = row['Direction']  # Get the direction from CSV
                 
                 # Convert time_diff to float, handling '<1' case
                 time_diff_value = 0.5 if time_diff == '<1' else float(time_diff)
                 
-                # Insert pedestrian data with both time difference and vehicle type
+                # Convert direction to binary (0 or 1)
+                # Assuming 'right_to_left' or similar positive direction is 1, and opposite is 0
+                direction_value = 1.0 if direction.lower() in ['right_to_left', 'forward', 'positive'] else 0.0
+                
+                # Insert pedestrian data with time difference, vehicle type, and direction
                 self.insert_track_data(
                     track_id=pedestrian_id,
                     object_type='pedestrian',
                     time_difference=time_diff_value,
-                    vehicle_type=vehicle_type  # Associate vehicle type with pedestrian ID
+                    vehicle_type=vehicle_type,  # Associate vehicle type with pedestrian ID
+                    speeds={11: direction_value}  # Add direction as behavior_id 11
                 )
                 
-                print(f"Processed PSM data for pedestrian {pedestrian_id} with vehicle type {vehicle_type}")
+                print(f"Processed PSM data for pedestrian {pedestrian_id}:")
+                print(f"- Vehicle type: {vehicle_type}")
+                print(f"- Direction: {direction} (value: {direction_value})")
+                print(f"- Time difference: {time_diff_value}")
             
             print("Successfully processed PSM results and updated database")
             
@@ -1337,6 +1313,264 @@ class PedestrianPipeline:
         }
         return vehicle_type_map.get(vehicle_type, 0)
 
+    def process_track(self, track_id: int, position: Tuple[float, float], frame_time: float, current_time: str = None) -> Dict:
+        """Process a track and return crossing information"""
+        # Get persistent ID for this track
+        persistent_id = self.get_persistent_id(track_id)
+        
+        # Initialize crossing times for new track
+        if persistent_id not in self.crossing_times:
+            self.crossing_times[persistent_id] = {}
+        
+        # Check line crossings
+        line_crossed = self.check_line_crossing(position, frame_time)
+        if line_crossed is not None:
+            # Use XML time if provided, otherwise use system time
+            crossing_time = current_time if current_time else datetime.now().strftime('%H:%M:%S')
+            
+            # Record the time for this line crossing if not already recorded
+            if line_crossed not in self.crossing_times[persistent_id]:
+                self.crossing_times[persistent_id][line_crossed] = crossing_time
+                
+                # Calculate lane and line numbers based on the order of input
+                actual_lane = (line_crossed // 3) + 1  # First lane is 1 (the first lane entered)
+                line_in_lane = (line_crossed % 3) + 1  # Line position within lane (1-3)
+                
+                print(f"\nLine crossing detected:")
+                print(f"Pedestrian {persistent_id} crossed line {line_crossed}")
+                print(f"Lane {actual_lane}, Line {line_in_lane}")
+                print(f"Time: {crossing_time}")
+                
+                # Save crossing to CSV immediately
+                self.update_crossing_csv(track_id, line_crossed, crossing_time)
+                
+                # Determine direction based on lane crossing
+                if actual_lane == 1 and line_in_lane == 1:
+                    # Starting from first lane, first line = forward direction
+                    direction_value = 1.0
+                    print(f"Setting forward direction for pedestrian {persistent_id}")
+                    try:
+                        self.insert_track_data(
+                            track_id=persistent_id,
+                            object_type='pedestrian',
+                            speeds={11: direction_value}  # behavior_id 11 for pedestrian_direction
+                        )
+                        print(f"Successfully inserted forward direction ({direction_value}) for pedestrian {persistent_id}")
+                    except Exception as e:
+                        print(f"Error inserting direction data: {e}")
+                elif actual_lane == self.num_lanes and line_in_lane == 1:
+                    # Starting from last lane, first line = reverse direction
+                    direction_value = 0.0
+                    print(f"Setting reverse direction for pedestrian {persistent_id}")
+                    try:
+                        self.insert_track_data(
+                            track_id=persistent_id,
+                            object_type='pedestrian',
+                            speeds={11: direction_value}  # behavior_id 11 for pedestrian_direction
+                        )
+                        print(f"Successfully inserted reverse direction ({direction_value}) for pedestrian {persistent_id}")
+                    except Exception as e:
+                        print(f"Error inserting direction data: {e}")
+        
+        # Check and update parking violation status
+        if persistent_id in self.parking_violations:
+            try:
+                print(f"Inserting parking violation for pedestrian {persistent_id}")
+                self.db_cursor.execute("""
+                    INSERT INTO scene_behavior_feature
+                    (scene_key, object_type, behavior_id, behavior_value)
+                    VALUES (%s, %s, %s, %s)
+                    ON DUPLICATE KEY UPDATE behavior_value = VALUES(behavior_value)
+                """, (persistent_id, 'pedestrian', 15, 1.0))  # behavior_id 15 for parking violation
+                self.db_connection.commit()
+                print(f"Successfully inserted parking violation for pedestrian {persistent_id}")
+            except Exception as e:
+                print(f"Error inserting parking violation data: {e}")
+                self.db_connection.rollback()
+        else:
+            try:
+                print(f"Setting no parking violation for pedestrian {persistent_id}")
+                self.db_cursor.execute("""
+                    INSERT INTO scene_behavior_feature
+                    (scene_key, object_type, behavior_id, behavior_value)
+                    VALUES (%s, %s, %s, %s)
+                    ON DUPLICATE KEY UPDATE behavior_value = VALUES(behavior_value)
+                """, (persistent_id, 'pedestrian', 15, 0.0))  # behavior_id 15 for no parking violation
+                self.db_connection.commit()
+                print(f"Successfully set no parking violation for pedestrian {persistent_id}")
+            except Exception as e:
+                print(f"Error setting no parking violation data: {e}")
+                self.db_connection.rollback()
+        
+        return {
+            'crossing_times': self.crossing_times.get(persistent_id, {})
+        }
+
+    def insert_vehicle_traffic(self, frame_count, counts):
+        """Insert vehicle traffic data with proper time handling"""
+        try:
+            # Get XML time based on frame count
+            current_time = read_time_from_xml(frame_count=frame_count, fps=self.fps)
+            hour = current_time.hour
+            minute = current_time.minute
+            
+            # Calculate 10-minute interval (0-5)
+            # For example:
+            # 15:37 -> minute=37 -> interval=3 (30-39 minutes)
+            # 15:52 -> minute=52 -> interval=5 (50-59 minutes)
+            minute_interval = min(minute // 10, 5)  # Ensure interval is 0-5
+            interval_start = minute_interval * 10
+            interval_end = min(interval_start + 9, 59)
+            
+            print(f"\nProcessing vehicle traffic data:")
+            print(f"Current XML time: {current_time.strftime('%Y-%m-%d %H:%M:%S')}")
+            print(f"Hour: {hour:02d}:00")
+            print(f"Current minute: {minute}")
+            print(f"Calculated interval: {minute_interval} ({interval_start:02d}-{interval_end:02d} minutes)")
+            
+            # Generate time_key using date and hour
+            time_key = int(f"{current_time.year}{current_time.month:02d}{current_time.day:02d}{hour:02d}")
+            print(f"Generated time_key: {time_key}")
+            
+            # First ensure time dimension entry exists for this hour
+            try:
+                self.db_cursor.execute(
+                    """INSERT IGNORE INTO time_dimension 
+                       (time_key, week, day, day_night, date, hour, minute)
+                       VALUES (%s, %s, %s, %s, %s, %s, %s)""",
+                    (
+                        time_key,
+                        f"Week{current_time.strftime('%V')}",
+                        current_time.strftime('%A'),
+                        'Day' if 6 <= hour <= 18 else 'Night',
+                        current_time.date(),
+                        hour,
+                        0  # Use 0 for the hour entry
+                    )
+                )
+                print(f"Time dimension entry ensured for hour {hour:02d}:00")
+                
+                # Debug: Check if time dimension entry exists
+                self.db_cursor.execute(
+                    "SELECT * FROM time_dimension WHERE time_key = %s",
+                    (time_key,)
+                )
+                time_entry = self.db_cursor.fetchone()
+                if time_entry:
+                    print(f"Confirmed time dimension entry: {time_entry}")
+                
+            except Exception as e:
+                print(f"Error ensuring time dimension entry: {e}")
+                raise
+            
+            # Now insert vehicle traffic data for this 10-minute interval
+            try:
+                print(f"\nInserting counts for interval {minute_interval}:")
+                print(f"Pedestrians: {counts.get('pedestrian', 0)}")
+                print(f"Cars: {counts.get('car', 0)}")
+                print(f"Buses: {counts.get('bus', 0)}")
+                print(f"Trucks: {counts.get('truck', 0)}")
+                
+                self.db_cursor.execute(
+                    """INSERT INTO vehicle_traffic 
+                       (time_key, hour, minute_interval, pedestrian_count, car_count, bus_count, truck_count)
+                       VALUES (%s, %s, %s, %s, %s, %s, %s)
+                       ON DUPLICATE KEY UPDATE
+                       pedestrian_count = pedestrian_count + VALUES(pedestrian_count),
+                       car_count = car_count + VALUES(car_count),
+                       bus_count = bus_count + VALUES(bus_count),
+                       truck_count = truck_count + VALUES(truck_count)""",
+                    (
+                        time_key,
+                        hour,
+                        minute_interval,
+                        counts.get('pedestrian', 0),
+                        counts.get('car', 0),
+                        counts.get('bus', 0),
+                        counts.get('truck', 0)
+                    )
+                )
+                
+                # Debug: Check current intervals for this hour
+                self.db_cursor.execute(
+                    """SELECT minute_interval, pedestrian_count, car_count, bus_count, truck_count 
+                       FROM vehicle_traffic 
+                       WHERE time_key = %s AND hour = %s
+                       ORDER BY minute_interval""",
+                    (time_key, hour)
+                )
+                intervals = self.db_cursor.fetchall()
+                print(f"\nCurrent intervals for hour {hour:02d}:00:")
+                for interval in intervals:
+                    interval_start = interval[0] * 10
+                    interval_end = min(interval_start + 9, 59)
+                    print(f"Interval {interval[0]} ({interval_start:02d}-{interval_end:02d} min): "
+                          f"Ped={interval[1]}, Car={interval[2]}, Bus={interval[3]}, Truck={interval[4]}")
+                
+                self.db_connection.commit()
+                print(f"\nSuccessfully updated vehicle traffic data")
+                
+            except Exception as e:
+                print(f"Error inserting vehicle traffic data: {e}")
+                self.db_connection.rollback()
+                raise
+            
+        except Exception as e:
+            print(f"Error in vehicle traffic processing: {e}")
+            self.db_connection.rollback()
+            import traceback
+            traceback.print_exc()
+
+    def setup_sample_data(self):
+        """Setup static data for the video session"""
+        try:
+            # Static data for the entire video
+            queries = [
+                """INSERT IGNORE INTO location_dimension 
+                   (location_key, metro_city_province, district, neighborhood, spot) 
+                   VALUES 
+                   (2, 'Islamabad', 'F-8', 'Margalla Road', 'Signal F-8/4'),
+                   (3, 'Islamabad', 'F-10', 'Margalla Avenue', 'Signal F-10/2')""",
+                
+                """INSERT IGNORE INTO road_character_dimension 
+                   (road_key, road_type, road_feature) 
+                   VALUES 
+                   (2, 'major_arterial', 'signalized_intersection'),
+                   (3, 'collector_road', 'pedestrian_crossing')""",
+                
+                """INSERT IGNORE INTO behavior_feature 
+                   (behavior_id, behavior_feature) 
+                   VALUES 
+                   (1, 'vehicle_acceleration'),
+                   (2, 'vehicle_speed_5m'),
+                   (3, 'vehicle_speed_10m'),
+                   (4, 'vehicle_speed_15m'),
+                   (5, 'vehicle_avg_speed'),
+                   (6, 'vehicle_class'),
+                   (10, 'pedestrian_parking'),
+                   (11, 'pedestrian_direction'),
+                   (12, 'pedestrian_speed'),
+                   (13, 'pedestrian_vehicle_type'),
+                   (14, 'pedestrian_psm'),
+                   (15, 'pedestrian_parking')"""
+            ]
+            
+            for query in queries:
+                try:
+                    self.db_cursor.execute(query)
+                    print(f"Successfully executed query: {query[:100]}...")
+                except Error as e:
+                    print(f"Error executing query: {e}")
+                    raise
+                
+            self.db_connection.commit()
+            print("Static video data setup complete")
+            
+        except Error as e:
+            print(f"Error setting up static data: {e}")
+            if self.db_connection:
+                self.db_connection.rollback()
+
 def main():
     try:
         # Configuration
@@ -1345,7 +1579,7 @@ def main():
 
         # Get video path from user
         while True:
-            video_path = input("\nEnter the path to the video file (or press Enter for default 'real4.mp4'): ").strip()
+            video_path = input("\nEnter the path to the MP4 file (or press Enter for default 'real4.mp4'): ").strip()
             if not video_path:
                 video_path = "real4.mp4"
             if os.path.exists(video_path):
@@ -1353,9 +1587,26 @@ def main():
                 break
             print(f"Error: Video file not found at: {video_path}")
 
+        # Get XML path from user
+        while True:
+            xml_path = input("\nEnter the path to the XML file (or press Enter for default 'D:\\fydp final\\ijp\\C0043M01.XML'): ").strip()
+            if not xml_path:
+                xml_path = "D:\\fydp final\\ijp\\C0043M01.XML"
+            if os.path.exists(xml_path):
+                print(f"Using XML file: {xml_path}")
+                break
+            print(f"Error: XML file not found at: {xml_path}")
+
+        # Update the read_time_from_xml function with the provided XML path
+        global read_time_from_xml
+        old_read_time_from_xml = read_time_from_xml
+        def new_read_time_from_xml(frame_count=0, fps=25):
+            return old_read_time_from_xml(xml_path, frame_count, fps)
+        read_time_from_xml = new_read_time_from_xml
+
         # Verify XML time is being used
         xml_time = read_time_from_xml()
-        print(f"XML time verification: {xml_time}")
+        print(f"\nXML time verification: {xml_time}")
         print(f"System time for comparison: {datetime.now()}")
         
         # Processor selection with default values

@@ -49,28 +49,43 @@ class PedestrianSpeedDetector:
         
         # Process each track
         for track in tracks:
-            track_id = int(track[4])
             bbox = track[:4]
-            center = (int((bbox[0] + bbox[2]) / 2), int((bbox[1] + bbox[3]) / 2))
+            track_id = int(track[4])
             
-            # Record position and time
+            # Store current position
+            current_pos = ((bbox[0] + bbox[2])/2, (bbox[1] + bbox[3])/2)
+            current_time = frame_time
+            
+            # Initialize track history if not exists
             if track_id not in self.track_history:
-                self.track_history[track_id] = []
-            self.track_history[track_id].append((center, frame_time))
+                self.track_history[track_id] = {
+                    'positions': [],
+                    'times': [],
+                    'parking': 0  # Initialize parking status
+                }
             
-            # Calculate speed if we have enough history
-            if len(self.track_history[track_id]) >= 2:
-                # Get positions and times
-                pos1, time1 = self.track_history[track_id][-2]
-                pos2, time2 = self.track_history[track_id][-1]
+            # Update track history
+            self.track_history[track_id]['positions'].append(current_pos)
+            self.track_history[track_id]['times'].append(current_time)
+            
+            # Keep only last N positions
+            max_history = 30  # Adjust based on your needs
+            if len(self.track_history[track_id]['positions']) > max_history:
+                self.track_history[track_id]['positions'] = self.track_history[track_id]['positions'][-max_history:]
+                self.track_history[track_id]['times'] = self.track_history[track_id]['times'][-max_history:]
+            
+            # Calculate distance and time difference
+            if len(self.track_history[track_id]['positions']) >= 2:
+                pos1 = self.track_history[track_id]['positions'][-2]
+                pos2 = self.track_history[track_id]['positions'][-1]
+                time1 = self.track_history[track_id]['times'][-2]
+                time2 = self.track_history[track_id]['times'][-1]
                 
-                # Calculate distance in pixels
-                distance_px = np.sqrt((pos2[0] - pos1[0])**2 + (pos2[1] - pos1[1])**2)
+                # Calculate distance in meters
+                distance_pixels = math.sqrt((pos2[0] - pos1[0])**2 + (pos2[1] - pos1[1])**2)
+                distance_m = distance_pixels / self.pixels_per_meter
                 
-                # Convert to meters
-                distance_m = distance_px / self.pixels_per_meter
-                
-                # Calculate time difference
+                # Calculate time difference in seconds
                 time_diff = time2 - time1
                 
                 if time_diff > 0:
@@ -90,6 +105,18 @@ class PedestrianSpeedDetector:
                         12: avg_speed  # Behavior ID 12 is for pedestrian_speed
                     }
                     self.pipeline.insert_track_data(track_id, 'pedestrian', speed_data)
+                    
+                    # Check for parking behavior (very low speed for extended period)
+                    if avg_speed < 0.5 and len(self.speeds[track_id]) >= 10:  # If speed < 0.5 km/h for 10 consecutive frames
+                        self.track_history[track_id]['parking'] = 1
+                    else:
+                        self.track_history[track_id]['parking'] = 0
+                    
+                    # Insert parking status as behavior_id 15
+                    parking_data = {
+                        15: float(self.track_history[track_id]['parking'])  # behavior_id 15 for parking status
+                    }
+                    self.pipeline.insert_track_data(track_id, 'pedestrian', parking_data)
                     
                     # Draw speed on frame
                     cv2.putText(processed_frame,
